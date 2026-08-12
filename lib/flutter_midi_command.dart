@@ -22,7 +22,8 @@ export 'package:flutter_midi_command_platform_interface/flutter_midi_command_pla
         MidiPairingRejectedException,
         MidiPort,
         MidiServiceDiscoveryException,
-        MidiSetupChange;
+        MidiSetupChange,
+        MidiWriteFailure;
 export 'package:flutter_midi_command_platform_interface/midi_device.dart'
     show MidiConnectionState, MidiDeviceType;
 export 'src/midi_transports.dart';
@@ -289,6 +290,17 @@ class MidiCommand {
   /// Returns the current Bluetooth state
   BluetoothState get bluetoothState => _bluetoothState;
 
+  /// Stream firing whenever the BLE transport could not deliver a write.
+  ///
+  /// [sendData] is fire-and-forget, so this is the only way to learn that a
+  /// packet was dropped. Bulk transfers that split a payload across many SysEx
+  /// messages — firmware updates in particular — should listen and treat any
+  /// event as a corrupted transfer.
+  ///
+  /// Null when no BLE transport is configured.
+  Stream<MidiWriteFailure>? get onBleWriteFailure =>
+      _bleTransport?.onWriteFailure;
+
   /// Starts the Bluetooth subsystem used for BLE MIDI discovery/connection.
   Future<void> startBluetooth() async {
     _requireTransport(MidiTransport.ble, 'startBluetooth');
@@ -501,6 +513,31 @@ class MidiCommand {
       _bleTransport!.sendData(data, deviceId: deviceId, timestamp: timestamp);
     }
     _txStreamCtrl.add(data);
+  }
+
+  /// Sends data and completes once the transport has actually written it,
+  /// letting a bulk transfer pace itself against the link rather than a guess.
+  ///
+  /// Only the BLE transport observes delivery; a device routed to the platform
+  /// backend completes immediately, exactly like [sendData].
+  Future<void> sendDataAwaitingDelivery(
+    Uint8List data, {
+    String? deviceId,
+    int? timestamp,
+  }) async {
+    if (deviceId != null &&
+        _activeDeviceRouteById[deviceId] == _MidiDeviceRoute.bleTransport &&
+        _bleTransport != null &&
+        isTransportEnabled(MidiTransport.ble)) {
+      await _bleTransport!.sendDataAwaitingDelivery(
+        data,
+        deviceId: deviceId,
+        timestamp: timestamp,
+      );
+      _txStreamCtrl.add(data);
+      return;
+    }
+    sendData(data, deviceId: deviceId, timestamp: timestamp);
   }
 
   /// Stream firing events whenever a typed MIDI message is received.

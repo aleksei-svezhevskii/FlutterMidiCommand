@@ -14,6 +14,7 @@ export 'package:flutter_midi_command_platform_interface/midi_connection_exceptio
 export 'package:flutter_midi_command_platform_interface/midi_packet.dart';
 export 'package:flutter_midi_command_platform_interface/midi_port.dart';
 export 'package:flutter_midi_command_platform_interface/midi_setup_change.dart';
+export 'package:flutter_midi_command_platform_interface/midi_write_failure.dart';
 
 abstract class MidiCommandPlatform extends PlatformInterface {
   /// Constructs a MidiCommandPlatform.

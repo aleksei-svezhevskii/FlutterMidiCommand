@@ -4,11 +4,26 @@ import 'dart:async';
 import 'dart:math';
 import 'dart:typed_data';
 
+import 'package:flutter/foundation.dart' show visibleForTesting;
 import 'package:flutter_midi_command_platform_interface/flutter_midi_command_platform_interface.dart';
 import 'package:universal_ble/universal_ble.dart';
 
 const midiServiceId = "03B80E5A-EDE8-4B33-A751-6CE34EC4C700";
 const midiCharacteristicId = "7772E5DB-3868-4112-A1A9-F2669D106BF3";
+
+/// Smallest BLE MIDI packet size every peripheral must accept, derived from the
+/// 23-byte default ATT MTU (20 = 23 - 3 bytes of ATT write overhead). Used
+/// until an MTU exchange tells us we can do better, and as the floor if one
+/// reports something implausible.
+const _minBleMidiPacketSize = 20;
+
+/// BLE MIDI header and timestamp bytes for timestamp 0.
+///
+/// The spec encodes a 13-bit millisecond timestamp as `0x80 | (ts >> 7)` in the
+/// header and `0x80 | (ts & 0x7F)` in the timestamp byte. This transport does
+/// not stamp outgoing messages, so both collapse to `0x80`.
+const _bleMidiHeader = 0x80;
+const _bleMidiTimestamp = 0x80;
 
 enum _DeviceState { none, interrogating, available, irrelevant }
 
@@ -52,12 +67,76 @@ enum _BleHandlerState {
 }
 
 class UniversalBleMidiTransport implements MidiBleTransport {
-  UniversalBleMidiTransport() {
+  /// Creates the transport.
+  ///
+  /// [useNegotiatedMtu] sizes BLE MIDI packets from the negotiated ATT MTU
+  /// instead of the 20-byte minimum, as the BLE MIDI specification prescribes.
+  /// Set it to `false` for a peripheral that agrees to a large MTU but
+  /// mishandles writes above 20 bytes; the symptom is SysEx arriving corrupt or
+  /// not at all, appearing only after upgrading this package.
+  ///
+  /// [requestHighPerformanceConnection] asks for a ~7.5-15 ms connection
+  /// interval rather than the OS default of ~30-50 ms, which bounds MIDI
+  /// latency. Set it to `false` in battery-sensitive apps that do not need low
+  /// latency. Only Android implements the hint.
+  ///
+  /// Both only matter where this transport carries the data. On iOS and macOS
+  /// `MidiCommand` hands a connected device to CoreMIDI, which then owns the
+  /// write path.
+  UniversalBleMidiTransport({
+    this.useNegotiatedMtu = true,
+    this.requestHighPerformanceConnection = true,
+  }) {
     UniversalBle.timeout = const Duration(seconds: 10);
     _registerCallbacks();
+    _reportWriteBacklog();
   }
 
+  /// Highest command queue depth reported since it was last empty.
+  int _peakQueueDepth = 0;
+
+  /// Reports when writes back up behind the link, meaning the application is
+  /// sending faster than it drains.
+  ///
+  /// Sampled at powers of four so a bulk transfer cannot flood the log.
+  void _reportWriteBacklog() {
+    UniversalBle.onQueueUpdate = (String queueId, int pendingCommands) {
+      if (pendingCommands == 0) {
+        _peakQueueDepth = 0;
+        return;
+      }
+      if (pendingCommands <= _peakQueueDepth) return;
+      _peakQueueDepth = pendingCommands;
+      if (pendingCommands == 4 ||
+          pendingCommands == 16 ||
+          pendingCommands == 64 ||
+          pendingCommands == 256) {
+        _log(
+          'write queue depth reached $pendingCommands on "$queueId"; '
+          'sends are outrunning the link',
+        );
+      }
+    };
+  }
+
+  /// See [UniversalBleMidiTransport.new].
+  final bool useNegotiatedMtu;
+
+  /// See [UniversalBleMidiTransport.new].
+  final bool requestHighPerformanceConnection;
+
+  /// Optional sink for diagnostics (MTU negotiation, packet sizing, connection
+  /// priority, write backlog). Defaults to null (silent).
+  ///
+  /// `transport.logHandler = (m) => debugPrint(m);`
+  void Function(String message)? logHandler;
+
+  void _log(String message) =>
+      logHandler?.call('[flutter_midi_command_ble] $message');
+
   final _rxStreamController = StreamController<MidiPacket>.broadcast();
+  final _writeFailureStreamController =
+      StreamController<MidiWriteFailure>.broadcast();
   final _setupStreamController = StreamController<MidiSetupChange>.broadcast();
   final _bluetoothStateStreamController = StreamController<String>.broadcast();
   final Map<String, _BleMidiDevice> _devices = {};
@@ -95,10 +174,10 @@ class UniversalBleMidiTransport implements MidiBleTransport {
         }
         return;
       }
-      _devices[result.deviceId] = _BleMidiDevice.visible(
+      _devices[result.deviceId] = _createDevice(
         deviceId: result.deviceId,
         name: result.name!,
-        rxStream: _rxStreamController,
+        visible: true,
       );
       _setupStreamController.add(MidiSetupChange.deviceAppeared);
     };
@@ -226,11 +305,24 @@ class UniversalBleMidiTransport implements MidiBleTransport {
   MidiDevice? registerKnownDevice(String id, String name) {
     return _devices.putIfAbsent(
       id,
-      () => _BleMidiDevice.hidden(
-        deviceId: id,
-        name: name,
-        rxStream: _rxStreamController,
-      ),
+      () => _createDevice(deviceId: id, name: name, visible: false),
+    );
+  }
+
+  _BleMidiDevice _createDevice({
+    required String deviceId,
+    required String name,
+    required bool visible,
+  }) {
+    return _BleMidiDevice(
+      deviceId: deviceId,
+      name: name,
+      visible: visible,
+      rxStream: _rxStreamController,
+      writeFailureStream: _writeFailureStreamController,
+      useNegotiatedMtu: useNegotiatedMtu,
+      requestHighPerformanceConnection: requestHighPerformanceConnection,
+      log: _log,
     );
   }
 
@@ -251,10 +343,10 @@ class UniversalBleMidiTransport implements MidiBleTransport {
         _devices[device.id] ??
         _devices.putIfAbsent(
           device.id,
-          () => _BleMidiDevice.visible(
+          () => _createDevice(
             deviceId: device.id,
             name: device.name,
-            rxStream: _rxStreamController,
+            visible: true,
           ),
         );
     try {
@@ -297,14 +389,23 @@ class UniversalBleMidiTransport implements MidiBleTransport {
 
   @override
   void sendData(Uint8List data, {int? timestamp, String? deviceId}) {
+    unawaited(sendDataAwaitingDelivery(data, deviceId: deviceId));
+  }
+
+  @override
+  Future<void> sendDataAwaitingDelivery(
+    Uint8List data, {
+    int? timestamp,
+    String? deviceId,
+  }) {
     _activateIfNeeded();
     if (deviceId != null) {
-      _devices[deviceId]?.send(data);
-      return;
+      return _devices[deviceId]?.send(data) ?? Future<void>.value();
     }
-    for (final device in _devices.values.where((d) => d.connected)) {
-      device.send(data);
-    }
+    return Future.wait([
+      for (final device in _devices.values.where((d) => d.connected))
+        device.send(data),
+    ]);
   }
 
   @override
@@ -313,6 +414,10 @@ class UniversalBleMidiTransport implements MidiBleTransport {
   @override
   Stream<MidiSetupChange> get onMidiSetupChanged =>
       _setupStreamController.stream;
+
+  @override
+  Stream<MidiWriteFailure> get onWriteFailure =>
+      _writeFailureStreamController.stream;
 
   @override
   void teardown() {
@@ -338,25 +443,103 @@ class UniversalBleMidiTransport implements MidiBleTransport {
   }
 }
 
-class _BleMidiDevice extends MidiDevice {
-  _BleMidiDevice.visible({
-    required this.deviceId,
-    required String name,
-    required StreamController<MidiPacket> rxStream,
-  }) : visible = true,
-       _rxStreamCtrl = rxStream,
-       super(deviceId, name, MidiDeviceType.ble, false);
+/// Splits a complete SysEx message into BLE MIDI packets of at most
+/// [maxWriteSize] bytes.
+///
+/// [bytes] must be a full message, `0xF0 ... 0xF7`. The framing follows the
+/// MMA BLE MIDI specification, which is what [_BleMidiDevice._parseBlePacket]
+/// expects on the way back in:
+///
+/// - every packet opens with a header byte;
+/// - the first packet also carries a timestamp byte before the `0xF0`;
+/// - continuation packets carry raw data only;
+/// - the closing `0xF7` is always preceded by a timestamp byte.
+///
+/// [maxWriteSize] is the negotiated ATT MTU minus 3 bytes of write overhead,
+/// floored at [_minBleMidiPacketSize].
+@visibleForTesting
+List<List<int>> buildBleMidiSysExPackets(List<int> bytes, int maxWriteSize) {
+  final writeSize = max(_minBleMidiPacketSize, maxWriteSize);
 
-  _BleMidiDevice.hidden({
+  // header + timestamp + payload + timestamp + 0xF7
+  if (bytes.length + 3 <= writeSize) {
+    return [
+      [
+        _bleMidiHeader,
+        _bleMidiTimestamp,
+        ...bytes.sublist(0, bytes.length - 1),
+        _bleMidiTimestamp,
+        bytes.last,
+      ],
+    ];
+  }
+
+  // Everything up to but excluding the closing 0xF7. The terminator is emitted
+  // with its timestamp byte by whichever packet has room for both.
+  final payload = bytes.sublist(0, bytes.length - 1);
+  final packets = <List<int>>[];
+  var offset = 0;
+  var isFirst = true;
+  var closed = false;
+
+  while (offset < payload.length) {
+    // The first packet spends one extra byte on the timestamp before 0xF0.
+    final overhead = isFirst ? 2 : 1;
+    final capacity = writeSize - overhead;
+    // A packet that also closes the SysEx needs two more bytes for the
+    // timestamp and 0xF7.
+    final closingCapacity = capacity - 2;
+    final remaining = payload.length - offset;
+
+    final canClose = remaining <= closingCapacity;
+    final take = canClose ? remaining : min(capacity, remaining);
+
+    final packet = <int>[
+      _bleMidiHeader,
+      if (isFirst) _bleMidiTimestamp,
+      ...payload.getRange(offset, offset + take),
+    ];
+    if (canClose) {
+      packet
+        ..add(_bleMidiTimestamp)
+        ..add(bytes.last);
+      closed = true;
+    }
+    packets.add(packet);
+    offset += take;
+    isFirst = false;
+  }
+
+  // The payload filled the last packet exactly, leaving no room for the
+  // terminator. A packet holding only the terminator is valid framing.
+  if (!closed) {
+    packets.add([_bleMidiHeader, _bleMidiTimestamp, bytes.last]);
+  }
+
+  return packets;
+}
+
+class _BleMidiDevice extends MidiDevice {
+  _BleMidiDevice({
     required this.deviceId,
     required String name,
+    required this.visible,
     required StreamController<MidiPacket> rxStream,
-  }) : visible = false,
-       _rxStreamCtrl = rxStream,
+    required StreamController<MidiWriteFailure> writeFailureStream,
+    required this.useNegotiatedMtu,
+    required this.requestHighPerformanceConnection,
+    required void Function(String message) log,
+  }) : _rxStreamCtrl = rxStream,
+       _writeFailureStreamCtrl = writeFailureStream,
+       _log = log,
        super(deviceId, name, MidiDeviceType.ble, false);
 
   final String deviceId;
   final StreamController<MidiPacket> _rxStreamCtrl;
+  final StreamController<MidiWriteFailure> _writeFailureStreamCtrl;
+  final bool useNegotiatedMtu;
+  final bool requestHighPerformanceConnection;
+  final void Function(String message) _log;
   bool visible;
 
   _DeviceState _devState = _DeviceState.none;
@@ -364,6 +547,15 @@ class _BleMidiDevice extends MidiDevice {
   BleCharacteristic? _midiCharacteristic;
   bool _bleLinkConnected = false;
   bool _readinessInProgress = false;
+
+  /// Largest BLE MIDI packet this link accepts, set from the negotiated MTU in
+  /// [_requestMtu]. Reset on every disconnect so a large size cannot survive
+  /// into a reconnect that negotiates a smaller MTU.
+  int _maxWriteSize = _minBleMidiPacketSize;
+
+  /// Length of the last SysEx whose packet split was logged, so a bulk
+  /// transfer reports its shape once instead of once per message.
+  int? _loggedSysExLength;
 
   void updateConnectionState(BleConnectionState state) {
     final isConnected = state == BleConnectionState.connected;
@@ -373,6 +565,8 @@ class _BleMidiDevice extends MidiDevice {
       _devState = _DeviceState.none;
       _midiService = null;
       _midiCharacteristic = null;
+      _maxWriteSize = _minBleMidiPacketSize;
+      _loggedSysExLength = null;
       return;
     }
 
@@ -479,6 +673,10 @@ class _BleMidiDevice extends MidiDevice {
         );
       } catch (_) {}
     }
+    // Hand the radio back to the default interval before dropping the link.
+    // Belt and braces: the OS resets connection parameters when the link goes
+    // away, so this only matters if the disconnect itself does not complete.
+    await _requestConnectionPriority(BleConnectionPriority.balanced);
     try {
       await UniversalBle.disconnect(deviceId);
     } catch (_) {
@@ -489,9 +687,26 @@ class _BleMidiDevice extends MidiDevice {
     _devState = _DeviceState.none;
     _midiService = null;
     _midiCharacteristic = null;
+    _maxWriteSize = _minBleMidiPacketSize;
+    _loggedSysExLength = null;
   }
 
-  Future<void> send(Uint8List bytes) async {
+  Future<void> _sendChain = Future<void>.value();
+
+  /// Sends [bytes], completing once written.
+  ///
+  /// Serialized: a SysEx spans several BLE packets that the receiver
+  /// reassembles statefully, so two overlapping sends would interleave their
+  /// packets in universal_ble's shared queue and the peripheral would
+  /// reassemble one message out of two.
+  Future<void> send(Uint8List bytes) {
+    final delivered = _sendChain.then((_) => _writeMessage(bytes));
+    // Absorb errors here, or one failed write stalls every later send.
+    _sendChain = delivered.catchError((Object _) {});
+    return delivered;
+  }
+
+  Future<void> _writeMessage(Uint8List bytes) async {
     if (bytes.isEmpty) {
       return;
     }
@@ -499,46 +714,33 @@ class _BleMidiDevice extends MidiDevice {
       return;
     }
 
-    const packetSize = 20;
-    var dataBytes = List<int>.from(bytes);
-
     if (bytes.first == 0xF0 && bytes.last == 0xF7) {
-      if (bytes.length > packetSize - 3) {
-        var packet = dataBytes.take(packetSize - 2).toList();
-        packet.insert(0, 0x80);
-        packet.insert(0, 0x80);
+      final packets = buildBleMidiSysExPackets(bytes, _maxWriteSize);
+      if (bytes.length != _loggedSysExLength) {
+        // Once per distinct SysEx size: a bulk transfer sends thousands of
+        // identical-length messages and this is the number that decides how
+        // long it takes.
+        _loggedSysExLength = bytes.length;
+        _log(
+          '$deviceId: ${bytes.length}-byte SysEx -> ${packets.length} '
+          'write(s) at $_maxWriteSize bytes',
+        );
+      }
+      for (final packet in packets) {
         await _sendBytes(packet);
-        dataBytes = dataBytes.skip(packetSize - 2).toList();
-
-        while (dataBytes.isNotEmpty) {
-          final pickCount = min(dataBytes.length, packetSize - 1);
-          packet = dataBytes.getRange(0, pickCount).toList();
-          packet.insert(0, 0x80);
-          if (packet.length < packetSize) {
-            packet.insert(packet.length - 1, 0x80);
-          }
-          await _sendBytes(packet);
-          if (dataBytes.length > packetSize - 2) {
-            dataBytes = dataBytes.skip(pickCount).toList();
-          } else {
-            return;
-          }
-        }
-      } else {
-        dataBytes.insert(bytes.length - 1, 0x80);
-        dataBytes.insert(0, 0x80);
-        dataBytes.insert(0, 0x80);
-        await _sendBytes(dataBytes);
       }
       return;
     }
 
+    // Channel and system messages are a few bytes each, so they are framed one
+    // message per packet and never need splitting.
+    final dataBytes = List<int>.from(bytes);
     var currentBuffer = <int>[];
     for (var i = 0; i < dataBytes.length; i++) {
       final byte = dataBytes[i];
       if ((byte & 0x80) != 0) {
-        currentBuffer.insert(0, 0x80);
-        currentBuffer.insert(0, 0x80);
+        currentBuffer.insert(0, _bleMidiTimestamp);
+        currentBuffer.insert(0, _bleMidiHeader);
       }
       currentBuffer.add(byte);
 
@@ -551,6 +753,11 @@ class _BleMidiDevice extends MidiDevice {
     }
   }
 
+  /// Writes one BLE MIDI packet, reporting rather than rethrowing a failure.
+  ///
+  /// Aborting mid-SysEx would leave the peripheral parsing a truncated
+  /// message, so the remaining packets still go out and callers learn about it
+  /// through [UniversalBleMidiTransport.onWriteFailure].
   Future<void> _sendBytes(List<int> bytes) async {
     try {
       await UniversalBle.write(
@@ -560,18 +767,73 @@ class _BleMidiDevice extends MidiDevice {
         Uint8List.fromList(bytes),
         withoutResponse: true,
       );
-    } catch (_) {}
+    } catch (error, stackTrace) {
+      if (!_writeFailureStreamCtrl.isClosed) {
+        _writeFailureStreamCtrl.add(
+          MidiWriteFailure(
+            deviceId: deviceId,
+            error: error,
+            stackTrace: stackTrace,
+          ),
+        );
+      }
+    }
   }
 
-  /// Asks for a larger ATT MTU so the peripheral can pack more of a SysEx dump
-  /// into each notification. Purely opportunistic: writes stay at the 20-byte
-  /// BLE MIDI packet size regardless, peripherals may refuse or ignore the
-  /// request, and Apple manages the MTU itself. It therefore runs last and
-  /// swallows failures — an MTU exchange must never cost us a working link.
+  /// Negotiates a larger ATT MTU and sizes outgoing packets from the result.
+  ///
+  /// `mtu - 3` is what fits in one write on both platforms: Android reports the
+  /// ATT MTU, and universal_ble's darwin side returns
+  /// `maximumWriteValueLength(.withoutResponse) + 3`.
+  ///
+  /// Opportunistic — failures are swallowed and leave packets at
+  /// [_minBleMidiPacketSize], because an MTU exchange must never cost a
+  /// working link.
   Future<void> _requestMtu() async {
+    if (!useNegotiatedMtu) {
+      _log(
+        '$deviceId: MTU sizing disabled, packets stay at '
+        '$_minBleMidiPacketSize bytes',
+      );
+      return;
+    }
     try {
-      await UniversalBle.requestMtu(deviceId, 247, timeout: _mtuTimeout);
-    } catch (_) {}
+      final mtu = await UniversalBle.requestMtu(
+        deviceId,
+        247,
+        timeout: _mtuTimeout,
+      );
+      _maxWriteSize = max(_minBleMidiPacketSize, mtu - 3);
+      _log('$deviceId: negotiated MTU $mtu, packet size $_maxWriteSize bytes');
+    } catch (error) {
+      _log(
+        '$deviceId: MTU negotiation failed ($error), packets stay at '
+        '$_maxWriteSize bytes',
+      );
+    }
+  }
+
+  /// Asks for a low-latency connection interval (~7.5-15 ms instead of the
+  /// ~30-50 ms default), which is the floor on MIDI latency.
+  ///
+  /// Best-effort: only Android implements it, and a peripheral can decline.
+  Future<void> _requestConnectionPriority(BleConnectionPriority priority) async {
+    if (!requestHighPerformanceConnection) {
+      return;
+    }
+    try {
+      await UniversalBle.requestConnectionPriority(
+        deviceId,
+        priority,
+        timeout: _mtuTimeout,
+      );
+      _log('$deviceId: connection priority set to ${priority.name}');
+    } catch (error) {
+      _log(
+        '$deviceId: connection priority ${priority.name} refused '
+        '($error); the OS interval applies',
+      );
+    }
   }
 
   Future<void> _prepareMidiReadiness({Duration? timeout}) async {
@@ -582,8 +844,10 @@ class _BleMidiDevice extends MidiDevice {
     // commands through one queue, so an MTU request issued on the connection
     // callback sits in front of service discovery and can stall it — long
     // enough on Android that the peripheral drops the link with GATT_ERROR
-    // 133 before the MIDI service is ever discovered.
+    // 133 before the MIDI service is ever discovered. The connection priority
+    // request shares that queue and so shares the constraint.
     await _requestMtu();
+    await _requestConnectionPriority(BleConnectionPriority.highPerformance);
     _devState = _DeviceState.available;
   }
 

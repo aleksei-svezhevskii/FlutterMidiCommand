@@ -1,3 +1,13 @@
+## 1.1.0
+
+ - FIX(ble): serialize writes per device so two SysEx messages sent in quick succession cannot interleave their BLE packets. The peripheral reassembles a multi-packet SysEx statefully, so interleaving silently merged two messages into corruption — the failure mode behind bulk transfers that break partway through with no BLE-level error.
+ - FEAT: add `MidiCommand.sendDataAwaitingDelivery`, completing once the transport has written the data rather than queued it, so a bulk transfer can pace against the link rather than a fixed delay. Only the BLE transport observes delivery; platform-routed devices complete immediately, as with `sendData`.
+ - FEAT(ble): size BLE MIDI packets from the negotiated ATT MTU and request a low-latency connection interval, both on by default. Together these cut the number of BLE writes per SysEx and lower MIDI latency. Note that they do not speed up a request/response protocol whose cost is the peripheral's turnaround: measured against a GEWA piano, the write path was ~1.4 ms of a ~495 ms per-packet round trip. New `UniversalBleMidiTransport` flags `useNegotiatedMtu` and `requestHighPerformanceConnection` opt out. These apply on Android, Windows and Linux; on iOS and macOS a connected device is handed over to CoreMIDI, which then owns the write path.
+ - FEAT: add `MidiCommand.onBleWriteFailure`, reporting BLE writes the platform rejected. `sendData` is fire-and-forget, so this is the only signal that a packet was dropped. Bulk transfers that split a payload across many SysEx messages should treat any event as a corrupted transfer. Silent on Apple platforms for devices handed off to CoreMIDI, which has no equivalent per-write signal, so it complements rather than replaces device-level acknowledgements.
+ - FIX(ble): emit the BLE MIDI timestamp byte before the closing `0xF7` in every SysEx packet. It was omitted whenever the remaining body was exactly one byte short of the packet size.
+ - BREAKING (implementers only): `MidiBleTransport` gained `onWriteFailure`. Classes using `implements MidiBleTransport` must declare it; `extends` and all API consumers are unaffected. See the platform interface changelog.
+ - Update federated package constraints to `^1.1.0`.
+
 ## 1.0.9
 
  - FIX(ble): stop the opportunistic MTU request from stalling Android connections. It was issued from the connection callback and, because universal_ble runs every GATT command through one queue, it sat in front of service discovery long enough for Android to drop the link with `GATT_ERROR` 133 (surfaced as `Unknown Error 133`).

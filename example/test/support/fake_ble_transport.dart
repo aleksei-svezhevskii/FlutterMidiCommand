@@ -88,6 +88,17 @@ class FakeBleTransport implements MidiBleTransport {
       _setupStreamController.stream;
 
   @override
+  Future<void> sendDataAwaitingDelivery(
+    Uint8List data, {
+    int? timestamp,
+    String? deviceId,
+  }) async =>
+      sendData(data, timestamp: timestamp, deviceId: deviceId);
+
+  @override
+  Stream<MidiWriteFailure> get onWriteFailure => const Stream.empty();
+
+  @override
   void teardown() {
     scanning = false;
     bluetoothStarted = false;

@@ -1,3 +1,9 @@
+## 1.1.0
+
+ - FEAT: add `MidiWriteFailure` and `MidiBleTransport.onWriteFailure`, so a BLE transport can report writes it accepted from the fire-and-forget `sendData` but could not deliver. The getter has a default empty-stream implementation for transports that cannot detect write failures.
+ - FEAT: add `MidiBleTransport.sendDataAwaitingDelivery`, which completes once the data has been written rather than queued, so a bulk transfer can pace against the link. Defaults to `sendData` for transports that cannot observe delivery.
+ - BREAKING (implementers only): a class using `implements MidiBleTransport` must now declare `onWriteFailure` and `sendDataAwaitingDelivery`, because Dart requires `implements` to provide every member regardless of a default body. Classes using `extends` are unaffected, as are all consumers of the API.
+
 ## 1.0.9
 
  - Bump "flutter_midi_command_platform_interface" to `1.0.9`.

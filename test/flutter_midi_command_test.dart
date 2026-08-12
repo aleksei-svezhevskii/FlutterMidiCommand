@@ -64,6 +64,7 @@ class _FakeBleTransport implements MidiBleTransport {
   final _rx = StreamController<MidiPacket>.broadcast();
   final _setup = StreamController<MidiSetupChange>.broadcast();
   final _state = StreamController<String>.broadcast();
+  final _writeFailures = StreamController<MidiWriteFailure>.broadcast();
 
   final sent = <Uint8List>[];
   final connected = <String>[];
@@ -130,8 +131,27 @@ class _FakeBleTransport implements MidiBleTransport {
   Stream<MidiSetupChange> get onMidiSetupChanged => _setup.stream;
 
   @override
+  Future<void> sendDataAwaitingDelivery(
+    Uint8List data, {
+    int? timestamp,
+    String? deviceId,
+  }) async {
+    awaitedSends.add(data);
+    sendData(data, timestamp: timestamp, deviceId: deviceId);
+  }
+
+  final awaitedSends = <Uint8List>[];
+
+  @override
+  Stream<MidiWriteFailure> get onWriteFailure => _writeFailures.stream;
+
+  @override
   void teardown() {
     teardownCalls += 1;
+  }
+
+  void emitWriteFailure(MidiWriteFailure failure) {
+    _writeFailures.add(failure);
   }
 
   void emitPacket(MidiPacket packet) {
@@ -397,6 +417,31 @@ void main() {
     expect(received[1].message, isA<NoteOffMessage>());
     expect(received[0].timestamp, 99);
     expect(received[1].timestamp, 99);
+  });
+
+  test('onBleWriteFailure forwards transport write failures', () async {
+    final platform = _FakePlatform();
+    final ble = _FakeBleTransport();
+    MidiCommand.setPlatformOverride(platform);
+    final midi = MidiCommand(bleTransport: ble);
+
+    final received = <MidiWriteFailure>[];
+    final sub = midi.onBleWriteFailure!.listen(received.add);
+
+    ble.emitWriteFailure(
+      const MidiWriteFailure(deviceId: 'ble-1', error: 'write-failed'),
+    );
+
+    await Future<void>.delayed(const Duration(milliseconds: 10));
+    await sub.cancel();
+
+    expect(received, hasLength(1));
+    expect(received.single.deviceId, 'ble-1');
+  });
+
+  test('onBleWriteFailure is null without a BLE transport', () async {
+    MidiCommand.setPlatformOverride(_FakePlatform());
+    expect(MidiCommand().onBleWriteFailure, isNull);
   });
 
   test('onMidiSetupChanged merges platform and BLE streams', () async {
