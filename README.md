@@ -326,6 +326,14 @@ If you want to remove BLE entirely, omit `flutter_midi_command_ble` and/or call:
 midi.configureBleTransport(null);
 ```
 
+The BLE transport sizes its packets from the negotiated ATT MTU and asks for a
+low-latency connection interval, both on by default. These affect Android,
+Windows and Linux; on iOS and macOS the device is handed off to CoreMIDI after
+connecting, so the OS owns the write path. See
+[the BLE package README](packages/flutter_midi_command_ble/README.md#throughput-and-latency)
+for the platform matrix, when to opt out, and for `onBleWriteFailure`, which
+reports writes the platform rejected.
+
 For local workspace development (like this monorepo), `path:` dependencies are still valid and used by the example app.
 
 ### 2) Bluetooth API rename

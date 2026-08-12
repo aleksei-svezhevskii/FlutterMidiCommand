@@ -1004,7 +1004,6 @@ class ConnectedVirtualOrNativeDevice : ConnectedDevice {
         MIDIPortDispose(outputPort)
     }
 
-    var buffer = UnsafeMutablePointer<MIDIPacket>.allocate(capacity: 2) // Don't know why I need to a capacity of 2 here. If I setup 1 I'm getting a crash.
     private lazy var midiPacketParser = MidiPacketParser { [weak self] bytes, timestamp in
         guard let self else {
             return
@@ -1021,19 +1020,45 @@ class ConnectedVirtualOrNativeDevice : ConnectedDevice {
     }
 
     func handlePacketList(_ packetList:UnsafePointer<MIDIPacketList>, srcConnRefCon:UnsafeMutableRawPointer?) {
-        let packets = packetList.pointee
-        let packet:MIDIPacket = packets.packet
-        var ap = buffer;
-        buffer.initialize(to:packet)
-
-        for _ in 0 ..< packets.numPackets {
-            let p = ap.pointee
-            var tmp = p.data
-            let data = Data(bytes: &tmp, count: Int(p.length))
-            let timestamp = p.timeStamp
-            parseData(data: data, timestamp: timestamp)
-            ap = MIDIPacketNext(ap)
+        var timestampFactor : Double = 1.0
+        var tb = mach_timebase_info_data_t()
+        let kError = mach_timebase_info(&tb)
+        if (kError == 0) {
+            timestampFactor = Double(tb.numer) / Double(tb.denom)
         }
+
+        // Iterate the original packet list memory. Copying MIDIPacket structs must be avoided:
+        // MIDIPacket is declared with a fixed 256 byte data field, so a struct copy truncates
+        // longer packets, and MIDIPacketNext on a copy walks unrelated memory for packets 2..n.
+        let packetListSize = MIDIPacketList.sizeInBytes(pktList: packetList)
+
+        // Copy raw data from packetList
+        let packetListAsRawData = Data(bytes: packetList, count: packetListSize)
+        var packetNumber = 0
+
+        for packet in packetList.unsafeSequence() {
+            let offsetStart = getOffsetForPackageData(packetList: packetList, packageNumber: (Int)(packetNumber))
+            let offsetEnd = (offsetStart + (Int)(packet.pointee.length) - 1)
+            let packetData = packetListAsRawData.subdata(in: Range(offsetStart...offsetEnd))
+
+            let timestamp = UInt64(round(Double(packet.pointee.timeStamp) * timestampFactor))
+
+            parseData(data: packetData, timestamp: timestamp)
+
+            packetNumber += 1
+        }
+    }
+
+    func getOffsetForPackageData(packetList: UnsafePointer<MIDIPacketList>, packageNumber: Int) -> Int {
+        var packageCount = 0
+        for packet in packetList.unsafeSequence() {
+            if (packageCount == packageNumber) {
+                return (Int)(UInt(bitPattern:Int(Int(bitPattern: packet))) - UInt(bitPattern:Int(Int(bitPattern: packetList)))) + MemoryLayout.offset(of: \MIDIPacket.data)!
+            }
+
+            packageCount += 1
+        }
+        return -1
     }
 
     func parseData(data: Data, timestamp: UInt64) {
@@ -1171,72 +1196,6 @@ class ConnectedNativeDevice : ConnectedVirtualOrNativeDevice {
         MIDIPortDispose(outputPort)
     }
 
-    override func handlePacketList(_ packetList:UnsafePointer<MIDIPacketList>, srcConnRefCon:UnsafeMutableRawPointer?) {
-        //        let deviceInfo = ["name" : name,
-        //                          "id": String(id),
-        //                          "type":"native"]
-
-        var timestampFactor : Double = 1.0
-        var tb = mach_timebase_info_data_t()
-        let kError = mach_timebase_info(&tb)
-        if (kError == 0) {
-            timestampFactor = Double(tb.numer) / Double(tb.denom)
-        }
-
-        // New implementation: Handles packages with a size larger then 256 bytes
-        if #available(macOS 10.15, iOS 13.0, *) {
-            let packetListSize = MIDIPacketList.sizeInBytes(pktList: packetList)
-
-            // Copy raw data from packetList
-            let packetListAsRawData = Data(bytes: packetList, count: packetListSize)
-            var packetNumber = 0
-
-            for packet in packetList.unsafeSequence() {
-                let offsetStart = getOffsetForPackageData(packetList: packetList, packageNumber: (Int)(packetNumber))
-                let offsetEnd = (offsetStart + (Int)(packet.pointee.length) - 1)
-                let packetData = packetListAsRawData.subdata(in: Range(offsetStart...offsetEnd))
-
-                let timestamp = UInt64(round(Double(packet.pointee.timeStamp) * timestampFactor))
-
-                parseData(data: packetData, timestamp: timestamp)
-
-                packetNumber += 1
-            }
-        } else {
-            // Original implementation: This implementation will not work with packages larger than 256 bytes
-            // The issue is due to the line (see below): let packet:MIDIPacket = packets.packet
-            // which will only copy the first 256 bytes from the received data
-            let packets = packetList.pointee
-            let packet:MIDIPacket = packets.packet // This will only copy the first 256 bytes!
-            var ap = buffer
-            ap.initialize(to:packet)
-
-            //        midiDebugLog("tb \(tb) timestamp \(timestampFactor)")
-            for _ in 0 ..< packets.numPackets {
-                let p = ap.pointee
-                var tmp = p.data
-                let data = Data(bytes: &tmp, count: Int(p.length))
-                let timestamp = UInt64(round(Double(p.timeStamp) * timestampFactor))
-                parseData(data: data, timestamp: timestamp)
-                ap = MIDIPacketNext(ap)
-            }
-            //        ap.deallocate()
-        }
-    }
-
-    func getOffsetForPackageData(packetList: UnsafePointer<MIDIPacketList>, packageNumber: Int) -> Int {
-            if #available(macOS 10.15, iOS 13.0, *) {
-                var packageCount = 0
-                for packet in packetList.unsafeSequence() {
-                    if (packageCount == packageNumber) {
-                        return (Int)(UInt(bitPattern:Int(Int(bitPattern: packet))) - UInt(bitPattern:Int(Int(bitPattern: packetList)))) + MemoryLayout.offset(of: \MIDIPacket.data)!
-                    }
-
-                    packageCount += 1
-                }
-            }
-            return -1
-        }
 }
 
 class ConnectedVirtualDevice : ConnectedVirtualOrNativeDevice {

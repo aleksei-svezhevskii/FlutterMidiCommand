@@ -85,6 +85,104 @@ Configure the transport once per application MIDI session, before reading
 available when they are read, so a subscription created before BLE is
 configured does not later acquire BLE events.
 
+### Throughput and latency
+
+Every BLE write costs at least one connection event: `universal_ble` runs writes
+through a single serialized queue and completes each one only from the
+platform's write callback, even for writes without response. Two things
+therefore decide how fast MIDI leaves the app, and both are on by default.
+
+| Option | Default | Effect |
+|---|---|---|
+| `useNegotiatedMtu` | `true` | Sizes BLE MIDI packets from the negotiated ATT MTU instead of the 20-byte minimum. |
+| `requestHighPerformanceConnection` | `true` | Asks for a ~7.5-15 ms connection interval instead of the OS default of ~30-50 ms. |
+
+A 137-byte SysEx is eight writes at the 23-byte default MTU, two at MTU 96, and
+one at MTU 247. Fewer writes means less radio time, less queue pressure and
+less battery.
+
+**This does not automatically make a bulk transfer faster.** If the protocol
+waits for the peripheral to acknowledge each message, the round trip is usually
+dominated by the peripheral, not by the link. Measured against a GEWA piano
+firmware transfer: handing a packet to the MIDI stack took ~1.4 ms, and waiting
+for the piano's ACK took ~495 ms — so the entire write path was 0.3% of the
+per-packet cost, and reducing eight writes to two changed the total transfer
+time by nothing measurable.
+
+Before tuning the transport for throughput, measure the split. If the wait
+dominates, the lever is the protocol — more payload per acknowledged message,
+or a window of more than one unacknowledged message — not the BLE layer.
+
+Turn them off only for a specific reason:
+
+```dart
+midi.configureBleTransport(
+  UniversalBleMidiTransport(
+    // For a peripheral that agrees to a large MTU but mishandles writes above
+    // 20 bytes. The symptom is SysEx arriving corrupt or not at all, appearing
+    // only after an upgrade to this version.
+    useNegotiatedMtu: false,
+    // For battery-sensitive apps that do not need low-latency MIDI.
+    requestHighPerformanceConnection: false,
+  ),
+);
+```
+
+Both requests are best-effort: a peripheral may refuse the MTU exchange, and
+several platforms do not implement a connection priority hint at all. Failures
+are swallowed, and the transport falls back to 20-byte packets and whatever
+interval the OS chooses.
+
+#### Platform support
+
+| Platform | Packet sizing | Connection priority | Outgoing data path |
+|---|---|---|---|
+| Android | ATT MTU | supported | this transport |
+| Windows | GATT `MaxPduSize` | not supported | this transport |
+| Linux | BlueZ MTU | not supported | this transport |
+| iOS / macOS | `maximumWriteValueLength` | not supported | **CoreMIDI after handoff** |
+
+**Apple platforms are the important exception.** After a BLE connection
+succeeds, `MidiCommand` hands the device over to its CoreMIDI counterpart and
+routes `sendData` through the platform backend from then on. Once that handoff
+completes, this transport no longer writes the device's MIDI, so neither
+`useNegotiatedMtu` nor `requestHighPerformanceConnection` affects it — CoreMIDI
+does its own BLE MIDI framing inside the OS, and neither option is exposed.
+
+In practice these options change throughput on Android, Windows and Linux, and
+on Apple platforms only for the window before the handoff completes or if no
+CoreMIDI counterpart appears. If a transfer is slow on iOS, this is not the
+knob to reach for.
+
+### Detecting dropped writes
+
+`sendData` is fire-and-forget, so a write the platform rejects is otherwise
+invisible. A transfer that splits a payload across many SysEx messages should
+watch for failures and treat any event as a corrupted transfer:
+
+```dart
+final failures = midi.onBleWriteFailure?.listen((failure) {
+  // Abort and restart the transfer; the peripheral has a hole in its data.
+});
+```
+
+The transport deliberately keeps sending the remaining packets of a SysEx after
+a failed write, because abandoning them mid-message would leave the peripheral
+parsing a truncated message. Recovery is the caller's decision.
+
+`onBleWriteFailure` only reports writes this transport made. It is therefore
+silent on Apple platforms for any device that has been handed off to CoreMIDI,
+which has no equivalent per-write failure signal. Treat the stream as an extra
+diagnostic on Android/Windows/Linux, not as a cross-platform integrity check —
+an application that needs to know a bulk transfer arrived intact still needs
+device-level acknowledgements.
+
+A fixed inter-packet delay is not a substitute for an acknowledgement protocol.
+The write queue applies backpressure that `sendData` does not expose, so a timer
+tuned against a fire-and-forget stack can outrun the link and build an unbounded
+backlog whose packets are still in flight long after the app believes the
+transfer finished. Pace bulk transfers on responses from the device.
+
 Subscribe to setup changes before starting discovery, then initialize and scan
 explicitly:
 

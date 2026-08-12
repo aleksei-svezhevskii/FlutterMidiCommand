@@ -11,6 +11,18 @@ class _FakeUniversalBlePlatform extends UniversalBlePlatform {
   final Set<String> pairingRemovedConnectIds = <String>{};
   final Set<String> failingReadIds = <String>{};
   final Set<String> failingSubscribeIds = <String>{};
+  final Set<String> failingWriteIds = <String>{};
+
+  /// MTU handed back from `requestMtu`, or null to echo what was asked for.
+  int? negotiatedMtu;
+  bool failMtu = false;
+
+  /// Simulated time for one BLE write, so overlapping sends can be observed.
+  Duration writeDelay = Duration.zero;
+
+  /// Payloads passed to `writeValue`, in order.
+  final List<List<int>> writtenPackets = <List<int>>[];
+  final List<BleConnectionPriority> priorityRequests = <BleConnectionPriority>[];
   final Set<String> rejectedPairIds = <String>{};
   final Map<String, List<BleService>> servicesByDevice =
       <String, List<BleService>>{};
@@ -150,12 +162,23 @@ class _FakeUniversalBlePlatform extends UniversalBlePlatform {
     String characteristic,
     Uint8List value,
     BleOutputProperty bleOutputProperty,
-  ) async {}
+  ) async {
+    if (writeDelay > Duration.zero) {
+      await Future<void>.delayed(writeDelay);
+    }
+    writtenPackets.add(value.toList());
+    if (failingWriteIds.contains(deviceId)) {
+      throw StateError('write-failed');
+    }
+  }
 
   @override
   Future<int> requestMtu(String deviceId, int expectedMtu) async {
     gattCalls.add('mtu');
-    return expectedMtu;
+    if (failMtu) {
+      throw StateError('mtu-failed');
+    }
+    return negotiatedMtu ?? expectedMtu;
   }
 
   @override
@@ -167,7 +190,10 @@ class _FakeUniversalBlePlatform extends UniversalBlePlatform {
   Future<void> requestConnectionPriority(
     String deviceId,
     BleConnectionPriority priority,
-  ) async {}
+  ) async {
+    gattCalls.add('priority');
+    priorityRequests.add(priority);
+  }
 
   @override
   Future<bool> isPaired(String deviceId) async {
@@ -339,7 +365,15 @@ void main() {
     await transport.connectToDevice((await transport.devices).single);
     await Future<void>.delayed(const Duration(milliseconds: 5));
 
-    expect(fakePlatform.gattCalls, <String>['discover', 'subscribe', 'mtu']);
+    // Both the MTU exchange and the connection priority request share
+    // universal_ble's single command queue, so both must come after discovery
+    // and subscription or they can stall the link into Android's GATT 133.
+    expect(fakePlatform.gattCalls, <String>[
+      'discover',
+      'subscribe',
+      'mtu',
+      'priority',
+    ]);
   });
 
   test('connectToDevice retries once through a transient GATT 133', () async {
@@ -634,5 +668,196 @@ void main() {
     expect(fakePlatform.onConnectionChange, isNotNull);
     expect(fakePlatform.onValueChange, isNotNull);
     expect(fakePlatform.onAvailabilityChange, isNotNull);
+  });
+
+  // A GEWA firmware data packet: F0 7E 10 07 02 <seq> <size> + 128 encoded
+  // bytes + checksum + F7. This is the message whose packet count decides how
+  // long a firmware transfer takes.
+  Uint8List firmwareSysEx([int marker = 0x00]) {
+    return Uint8List.fromList(<int>[
+      0xF0, 0x7E, 0x10, 0x07, 0x02, 0x00, 0x7F,
+      ...List<int>.filled(128, marker),
+      0x2A,
+      0xF7,
+    ]);
+  }
+
+  Future<MidiDevice> connectDevice(
+    UniversalBleMidiTransport target,
+    String deviceId,
+  ) async {
+    fakePlatform.servicesByDevice[deviceId] = midiServices();
+    fakePlatform.emitScanDevice(
+      BleDevice(deviceId: deviceId, name: deviceId, services: <String>[]),
+    );
+    final device = (await target.devices).firstWhere((d) => d.id == deviceId);
+    await target.connectToDevice(device);
+    await Future<void>.delayed(const Duration(milliseconds: 5));
+    return device;
+  }
+
+  test('a large MTU sends a firmware SysEx as a single write', () async {
+    fakePlatform.negotiatedMtu = 247;
+    await connectDevice(transport, 'ble-mtu-large');
+    fakePlatform.writtenPackets.clear();
+
+    transport.sendData(firmwareSysEx(), deviceId: 'ble-mtu-large');
+    await Future<void>.delayed(const Duration(milliseconds: 5));
+
+    expect(fakePlatform.writtenPackets, hasLength(1));
+    expect(fakePlatform.writtenPackets.single, hasLength(137 + 3));
+  });
+
+  test('the default 23-byte MTU still sends 20-byte packets', () async {
+    fakePlatform.negotiatedMtu = 23;
+    await connectDevice(transport, 'ble-mtu-small');
+    fakePlatform.writtenPackets.clear();
+
+    transport.sendData(firmwareSysEx(), deviceId: 'ble-mtu-small');
+    await Future<void>.delayed(const Duration(milliseconds: 5));
+
+    expect(fakePlatform.writtenPackets, hasLength(8));
+    for (final packet in fakePlatform.writtenPackets) {
+      expect(packet.length, lessThanOrEqualTo(20));
+    }
+  });
+
+  test('a failed MTU exchange falls back to 20-byte packets', () async {
+    fakePlatform.failMtu = true;
+    await connectDevice(transport, 'ble-mtu-failed');
+    fakePlatform.writtenPackets.clear();
+
+    transport.sendData(firmwareSysEx(), deviceId: 'ble-mtu-failed');
+    await Future<void>.delayed(const Duration(milliseconds: 5));
+
+    expect(fakePlatform.writtenPackets, hasLength(8));
+  });
+
+  test('useNegotiatedMtu: false pins packets to 20 bytes', () async {
+    final pinned = UniversalBleMidiTransport(useNegotiatedMtu: false);
+    fakePlatform.negotiatedMtu = 247;
+    await connectDevice(pinned, 'ble-mtu-opt-out');
+    fakePlatform.writtenPackets.clear();
+
+    pinned.sendData(firmwareSysEx(), deviceId: 'ble-mtu-opt-out');
+    await Future<void>.delayed(const Duration(milliseconds: 5));
+
+    expect(fakePlatform.writtenPackets, hasLength(8));
+    expect(fakePlatform.gattCalls, isNot(contains('mtu')));
+    pinned.teardown();
+  });
+
+  test('a reconnect does not inherit the previous link packet size', () async {
+    fakePlatform.negotiatedMtu = 247;
+    final device = await connectDevice(transport, 'ble-mtu-reconnect');
+
+    // Drop the link, then bring it back with a peripheral that only offers the
+    // default MTU. A stale 244-byte write size would corrupt every SysEx.
+    transport.disconnectDevice(device);
+    await Future<void>.delayed(const Duration(milliseconds: 5));
+
+    fakePlatform.negotiatedMtu = 23;
+    await connectDevice(transport, 'ble-mtu-reconnect');
+    fakePlatform.writtenPackets.clear();
+
+    transport.sendData(firmwareSysEx(), deviceId: 'ble-mtu-reconnect');
+    await Future<void>.delayed(const Duration(milliseconds: 5));
+
+    expect(fakePlatform.writtenPackets, hasLength(8));
+  });
+
+  test('connection priority goes high on connect, balanced on '
+      'disconnect', () async {
+    final device = await connectDevice(transport, 'ble-priority');
+
+    expect(fakePlatform.priorityRequests, <BleConnectionPriority>[
+      BleConnectionPriority.highPerformance,
+    ]);
+
+    transport.disconnectDevice(device);
+    await Future<void>.delayed(const Duration(milliseconds: 5));
+
+    expect(fakePlatform.priorityRequests, <BleConnectionPriority>[
+      BleConnectionPriority.highPerformance,
+      BleConnectionPriority.balanced,
+    ]);
+  });
+
+  test('requestHighPerformanceConnection: false requests no priority', () async {
+    final relaxed = UniversalBleMidiTransport(
+      requestHighPerformanceConnection: false,
+    );
+    final device = await connectDevice(relaxed, 'ble-priority-opt-out');
+    relaxed.disconnectDevice(device);
+    await Future<void>.delayed(const Duration(milliseconds: 5));
+
+    expect(fakePlatform.priorityRequests, isEmpty);
+    relaxed.teardown();
+  });
+
+  test('overlapping sends do not interleave their SysEx packets', () async {
+    fakePlatform.negotiatedMtu = 23; // Force multi-packet SysEx.
+    fakePlatform.writeDelay = const Duration(milliseconds: 2);
+    await connectDevice(transport, 'ble-interleave');
+    fakePlatform.writtenPackets.clear();
+
+    // Two SysEx messages sent back to back without awaiting the first, which
+    // is what a bulk transfer paced by a timer does. Their BLE packets must
+    // not interleave: the peripheral reassembles a SysEx statefully across
+    // packets, so interleaving silently merges two messages into garbage.
+    transport.sendData(firmwareSysEx(0x01), deviceId: 'ble-interleave');
+    transport.sendData(firmwareSysEx(0x02), deviceId: 'ble-interleave');
+    await Future<void>.delayed(const Duration(milliseconds: 200));
+
+    // Every packet of the first message must precede every packet of the
+    // second. Payload bytes carry the message marker.
+    final markers = fakePlatform.writtenPackets
+        .map((packet) => packet.contains(0x01) ? 1 : 2)
+        .toList();
+    final firstTwo = markers.indexOf(2);
+    expect(firstTwo, greaterThan(0), reason: 'no packets for message 1');
+    expect(markers.sublist(0, firstTwo).every((m) => m == 1), isTrue,
+        reason: 'interleaved packet ordering: $markers');
+    expect(markers.sublist(firstTwo).every((m) => m == 2), isTrue,
+        reason: 'interleaved packet ordering: $markers');
+  });
+
+  test('sendDataAwaitingDelivery completes only after the writes land',
+      () async {
+    fakePlatform.negotiatedMtu = 23;
+    fakePlatform.writeDelay = const Duration(milliseconds: 2);
+    await connectDevice(transport, 'ble-awaited');
+    fakePlatform.writtenPackets.clear();
+
+    final delivered = transport.sendDataAwaitingDelivery(
+      firmwareSysEx(0x01),
+      deviceId: 'ble-awaited',
+    );
+    expect(fakePlatform.writtenPackets.length, lessThan(8),
+        reason: 'writes should still be in flight immediately after the call');
+
+    await delivered;
+    expect(fakePlatform.writtenPackets, hasLength(8));
+  });
+
+  test('a failed write is reported and the SysEx still completes', () async {
+    fakePlatform.negotiatedMtu = 23;
+    await connectDevice(transport, 'ble-write-fail');
+    fakePlatform.failingWriteIds.add('ble-write-fail');
+    fakePlatform.writtenPackets.clear();
+
+    final failures = <MidiWriteFailure>[];
+    final sub = transport.onWriteFailure.listen(failures.add);
+
+    transport.sendData(firmwareSysEx(), deviceId: 'ble-write-fail');
+    await Future<void>.delayed(const Duration(milliseconds: 10));
+    await sub.cancel();
+
+    // Every packet is still attempted: abandoning the rest of a SysEx would
+    // leave the peripheral parsing a truncated message.
+    expect(fakePlatform.writtenPackets, hasLength(8));
+    expect(failures, hasLength(8));
+    expect(failures.first.deviceId, 'ble-write-fail');
+    expect(failures.first.error, isA<StateError>());
   });
 }

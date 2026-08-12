@@ -163,4 +163,84 @@ void main() {
       reason: 'Multi-packet SysEx must reassemble without framing/RT bytes',
     );
   });
+
+  test('buildBleMidiSysExPackets respects the write size and framing', () {
+    for (final writeSize in <int>[20, 23, 100, 244]) {
+      for (var bodyLength = 0; bodyLength <= 300; bodyLength++) {
+        final sysEx = <int>[
+          0xF0,
+          ...List<int>.generate(bodyLength, (i) => i % 0x80),
+          0xF7,
+        ];
+        final packets = buildBleMidiSysExPackets(sysEx, writeSize);
+
+        expect(packets, isNotEmpty, reason: 'w=$writeSize b=$bodyLength');
+        for (final packet in packets) {
+          expect(
+            packet.length,
+            lessThanOrEqualTo(writeSize),
+            reason: 'packet exceeds the MTU: w=$writeSize b=$bodyLength',
+          );
+          expect(
+            packet.first,
+            0x80,
+            reason: 'every packet opens with a header byte',
+          );
+        }
+        // The closing 0xF7 must always be preceded by a timestamp byte. The
+        // previous chunker dropped it whenever the remainder was exactly
+        // writeSize - 1 bytes.
+        final last = packets.last;
+        expect(last.last, 0xF7, reason: 'w=$writeSize b=$bodyLength');
+        expect(
+          last[last.length - 2],
+          0x80,
+          reason: 'missing timestamp before F7: w=$writeSize b=$bodyLength',
+        );
+      }
+    }
+  });
+
+  test('BLE MIDI SysEx survives a chunk/parse round-trip at any size', () async {
+    BleCapabilities.hasSystemPairingApi = true;
+    final fake = _FakePlatform();
+    UniversalBle.setInstance(fake);
+    final transport = UniversalBleMidiTransport();
+
+    fake.servicesByDevice['dev'] = midiServices();
+    fake.emitScan('dev', 'GEWA');
+    final device = (await transport.devices).single;
+    await transport.connectToDevice(device);
+    await Future<void>.delayed(const Duration(milliseconds: 5));
+
+    final received = <List<int>>[];
+    final sub = transport.onMidiDataReceived.listen(
+      (p) => received.add(p.data.toList()),
+    );
+
+    // Sweep every body length across the packet boundaries of several write
+    // sizes, feeding the chunker's own output back through the parser.
+    final expected = <List<int>>[];
+    for (final writeSize in <int>[20, 23, 100, 244]) {
+      for (var bodyLength = 0; bodyLength <= 200; bodyLength++) {
+        final sysEx = <int>[
+          0xF0,
+          ...List<int>.generate(bodyLength, (i) => i % 0x80),
+          0xF7,
+        ];
+        expected.add(sysEx);
+        for (final packet in buildBleMidiSysExPackets(sysEx, writeSize)) {
+          fake.emitValue('dev', packet);
+        }
+      }
+    }
+
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+    await sub.cancel();
+
+    expect(received, hasLength(expected.length));
+    for (var i = 0; i < expected.length; i++) {
+      expect(received[i], expected[i], reason: 'round-trip mismatch at $i');
+    }
+  });
 }
