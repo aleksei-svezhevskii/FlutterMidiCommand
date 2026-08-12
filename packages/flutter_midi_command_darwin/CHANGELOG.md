@@ -1,5 +1,7 @@
 ## 1.1.0
 
+ - FIX: read every packet of a coalesced `MIDIPacketList` from the original list memory. The shared implementation copied only the first `MIDIPacket` — a fixed 256-byte struct — then walked `MIDIPacketNext` over that copy, so any packet after the first came from unrelated memory and anything longer than 256 bytes was truncated. Small coalesced packets appeared to work because the struct copy happened to carry them along, so this surfaced only with large SysEx or more than 256 bytes of coalesced data. Virtual devices used the broken path; native devices already had a correct override, which is now shared rather than duplicated.
+ - BREAKING (virtual devices only): timestamps from virtual devices are now converted to nanoseconds via `mach_timebase_info`, matching what native devices already reported, instead of being passed through as raw mach ticks.
  - Bump "flutter_midi_command_darwin" to `1.1.0` and update the platform interface dependency constraint to `^1.1.0`.
 
 ## 1.0.9
