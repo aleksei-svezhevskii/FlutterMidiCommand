@@ -13,6 +13,10 @@ class _FakeUniversalBlePlatform extends UniversalBlePlatform {
   final Set<String> pairingRemovedConnectIds = <String>{};
   final Set<String> failingReadIds = <String>{};
   final Set<String> failingSubscribeIds = <String>{};
+
+  /// Devices whose `setNotifiable` fails because the peer discarded its bond,
+  /// rather than the connect call failing that way.
+  final Set<String> pairingRemovedSubscribeIds = <String>{};
   final Set<String> failingWriteIds = <String>{};
 
   /// MTU handed back from `requestMtu`, or null to echo what was asked for.
@@ -104,9 +108,13 @@ class _FakeUniversalBlePlatform extends UniversalBlePlatform {
     if (pairingRemovedConnectIds.contains(deviceId)) {
       updateConnection(deviceId, false, 'Peer removed pairing information');
       _connectionByDevice[deviceId] = BleConnectionState.disconnected;
+      // Shaped as universal_ble really reports it: a connection-state failure
+      // goes through `ConnectionException(reason)`, which puts the reason
+      // string in `details` as well as the message.
       throw UniversalBleException(
         code: UniversalBleErrorCode.unknownError,
         message: 'Peer removed pairing information',
+        details: 'Peer removed pairing information',
       );
     }
     if (failingConnectIds.contains(deviceId)) {
@@ -153,6 +161,15 @@ class _FakeUniversalBlePlatform extends UniversalBlePlatform {
         code: UniversalBleErrorCode.unknownError,
         message: 'Failed to update subscription state',
         details: '133',
+      );
+    }
+    if (pairingRemovedSubscribeIds.contains(deviceId)) {
+      updateConnection(deviceId, false, 'Peer removed pairing information');
+      _connectionByDevice[deviceId] = BleConnectionState.disconnected;
+      throw UniversalBleException(
+        code: UniversalBleErrorCode.unknownError,
+        message: 'Peer removed pairing information',
+        details: 'Peer removed pairing information',
       );
     }
     if (failingSubscribeIds.contains(deviceId)) {
@@ -447,6 +464,34 @@ void main() {
     expect((await transport.devices).single.id, 'ble-sub-133');
   });
 
+  test('removed pairing is typed even when a later stage reports it', () async {
+    // The peer can discard its bond at a stage past the connect, where the
+    // failure arrives wrapped in that stage's exception. Unwrapped, it is the
+    // same condition and must reach the application as the same typed error —
+    // otherwise a caller retrying on it never sees it.
+    debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
+    addTearDown(() => debugDefaultTargetPlatformOverride = null);
+    fakePlatform.servicesByDevice['ble-late-bond'] = midiServices();
+    fakePlatform.pairingRemovedSubscribeIds.add('ble-late-bond');
+    fakePlatform.emitScanDevice(
+      BleDevice(
+        deviceId: 'ble-late-bond',
+        name: 'Late Stale Bond',
+        services: <String>[],
+      ),
+    );
+    final device = (await transport.devices).single;
+
+    await expectLater(
+      transport.connectToDevice(device),
+      throwsA(isA<MidiPairingInfoRemovedException>()),
+    );
+    expect(device.connected, isFalse);
+    expect(fakePlatform.unpairCalls, contains('ble-late-bond'));
+    // Surfaced, not retried: a discarded bond is not a transient link fault.
+    expect(fakePlatform.connectCalls, <String>['ble-late-bond']);
+  });
+
   test('a 133 in details is not treated as a GATT error off Android', () async {
     // Apple puts the raw NSError code in the same field, and 133 is 0x85 —
     // inside CBATTError's application-defined range, where it means something
@@ -540,6 +585,10 @@ void main() {
   test(
     'connectToDevice maps removed pairing information to a typed exception',
     () async {
+      // iOS is where this error actually occurs, and it must be classified as
+      // a removed bond rather than as a transient failure to retry blindly.
+      debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
+      addTearDown(() => debugDefaultTargetPlatformOverride = null);
       fakePlatform.servicesByDevice['ble-stale-bond'] = midiServices();
       fakePlatform.pairingRemovedConnectIds.add('ble-stale-bond');
       fakePlatform.emitScanDevice(
