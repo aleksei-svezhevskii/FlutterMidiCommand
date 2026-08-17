@@ -1,9 +1,15 @@
 .DS_Store
 .dart_tool/
+/tasks/
 
 .packages
 .pub/
 pubspec.lock
+# The workspace root lock is committed so CI resolves what was tested. Without
+# it every run re-resolves, and a dependency published upstream fails a branch
+# that never touched the affected code. Published packages carry no lock of
+# their own — under pub workspaces there is only this one.
+!/pubspec.lock
 # Under Dart pub workspaces (Melos 7+), local packages are linked via the
 # root `workspace:` list, not per-package overrides. Melos no longer generates
 # these, and `dependency_overrides` are only legal in the workspace root.

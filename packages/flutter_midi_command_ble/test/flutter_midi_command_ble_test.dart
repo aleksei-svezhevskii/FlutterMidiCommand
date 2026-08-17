@@ -1,5 +1,7 @@
 import 'dart:typed_data';
 
+import 'package:flutter/foundation.dart'
+    show TargetPlatform, debugDefaultTargetPlatformOverride;
 import 'package:flutter_midi_command_ble/flutter_midi_command_ble.dart';
 import 'package:flutter_midi_command_platform_interface/flutter_midi_command_platform_interface.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -11,6 +13,10 @@ class _FakeUniversalBlePlatform extends UniversalBlePlatform {
   final Set<String> pairingRemovedConnectIds = <String>{};
   final Set<String> failingReadIds = <String>{};
   final Set<String> failingSubscribeIds = <String>{};
+
+  /// Devices whose `setNotifiable` fails because the peer discarded its bond,
+  /// rather than the connect call failing that way.
+  final Set<String> pairingRemovedSubscribeIds = <String>{};
   final Set<String> failingWriteIds = <String>{};
 
   /// MTU handed back from `requestMtu`, or null to echo what was asked for.
@@ -33,6 +39,11 @@ class _FakeUniversalBlePlatform extends UniversalBlePlatform {
   /// Number of remaining `connect` attempts that fail with Android's generic
   /// GATT_ERROR, keyed by device id.
   final Map<String, int> transientGattFailures = <String, int>{};
+
+  /// Number of remaining `setNotifiable` attempts that fail the way Android
+  /// does when the link drops mid-handshake: named after the operation, with
+  /// the GATT status carried in `details` as a string.
+  final Map<String, int> transientGattSubscribeFailures = <String, int>{};
 
   /// GATT operations in the order the transport issued them.
   final List<String> gattCalls = <String>[];
@@ -97,9 +108,13 @@ class _FakeUniversalBlePlatform extends UniversalBlePlatform {
     if (pairingRemovedConnectIds.contains(deviceId)) {
       updateConnection(deviceId, false, 'Peer removed pairing information');
       _connectionByDevice[deviceId] = BleConnectionState.disconnected;
+      // Shaped as universal_ble really reports it: a connection-state failure
+      // goes through `ConnectionException(reason)`, which puts the reason
+      // string in `details` as well as the message.
       throw UniversalBleException(
         code: UniversalBleErrorCode.unknownError,
         message: 'Peer removed pairing information',
+        details: 'Peer removed pairing information',
       );
     }
     if (failingConnectIds.contains(deviceId)) {
@@ -136,6 +151,27 @@ class _FakeUniversalBlePlatform extends UniversalBlePlatform {
   ) async {
     gattCalls.add('subscribe');
     subscribeCalls.add(deviceId);
+    final remainingGattFailures =
+        transientGattSubscribeFailures[deviceId] ?? 0;
+    if (remainingGattFailures > 0) {
+      transientGattSubscribeFailures[deviceId] = remainingGattFailures - 1;
+      updateConnection(deviceId, false);
+      _connectionByDevice[deviceId] = BleConnectionState.disconnected;
+      throw UniversalBleException(
+        code: UniversalBleErrorCode.unknownError,
+        message: 'Failed to update subscription state',
+        details: '133',
+      );
+    }
+    if (pairingRemovedSubscribeIds.contains(deviceId)) {
+      updateConnection(deviceId, false, 'Peer removed pairing information');
+      _connectionByDevice[deviceId] = BleConnectionState.disconnected;
+      throw UniversalBleException(
+        code: UniversalBleErrorCode.unknownError,
+        message: 'Peer removed pairing information',
+        details: 'Peer removed pairing information',
+      );
+    }
     if (failingSubscribeIds.contains(deviceId)) {
       throw StateError('subscribe-failed');
     }
@@ -398,6 +434,115 @@ void main() {
     expect((await transport.devices).single.id, 'ble-133');
   });
 
+  test('connectToDevice retries when the link drops during subscribe', () async {
+    // The link comes up, then goes away part-way through the handshake. Android
+    // names that failure after the operation rather than reporting a plain
+    // GATT_ERROR, so it only gets classified as transient if the status in
+    // `details` is read through the stage wrapper.
+    debugDefaultTargetPlatformOverride = TargetPlatform.android;
+    addTearDown(() => debugDefaultTargetPlatformOverride = null);
+    fakePlatform.servicesByDevice['ble-sub-133'] = midiServices();
+    fakePlatform.transientGattSubscribeFailures['ble-sub-133'] = 1;
+    fakePlatform.emitScanDevice(
+      BleDevice(
+        deviceId: 'ble-sub-133',
+        name: 'Flaky Handshake',
+        services: <String>[],
+      ),
+    );
+    final device = (await transport.devices).single;
+
+    await transport.connectToDevice(device);
+    await Future<void>.delayed(const Duration(milliseconds: 5));
+
+    expect(fakePlatform.connectCalls, <String>['ble-sub-133', 'ble-sub-133']);
+    expect(fakePlatform.subscribeCalls, <String>[
+      'ble-sub-133',
+      'ble-sub-133',
+    ]);
+    expect(device.connected, isTrue);
+    expect((await transport.devices).single.id, 'ble-sub-133');
+  });
+
+  test('removed pairing is typed even when a later stage reports it', () async {
+    // The peer can discard its bond at a stage past the connect, where the
+    // failure arrives wrapped in that stage's exception. Unwrapped, it is the
+    // same condition and must reach the application as the same typed error —
+    // otherwise a caller retrying on it never sees it.
+    debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
+    addTearDown(() => debugDefaultTargetPlatformOverride = null);
+    fakePlatform.servicesByDevice['ble-late-bond'] = midiServices();
+    fakePlatform.pairingRemovedSubscribeIds.add('ble-late-bond');
+    fakePlatform.emitScanDevice(
+      BleDevice(
+        deviceId: 'ble-late-bond',
+        name: 'Late Stale Bond',
+        services: <String>[],
+      ),
+    );
+    final device = (await transport.devices).single;
+
+    await expectLater(
+      transport.connectToDevice(device),
+      throwsA(isA<MidiPairingInfoRemovedException>()),
+    );
+    expect(device.connected, isFalse);
+    expect(fakePlatform.unpairCalls, contains('ble-late-bond'));
+    // Surfaced, not retried: a discarded bond is not a transient link fault.
+    expect(fakePlatform.connectCalls, <String>['ble-late-bond']);
+  });
+
+  test('a 133 in details is not treated as a GATT error off Android', () async {
+    // Apple puts the raw NSError code in the same field, and 133 is 0x85 —
+    // inside CBATTError's application-defined range, where it means something
+    // unrelated. Reading it as an Android GATT status there would retry a
+    // failure that is not transient.
+    debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
+    addTearDown(() => debugDefaultTargetPlatformOverride = null);
+    fakePlatform.servicesByDevice['ble-att-85'] = midiServices();
+    fakePlatform.transientGattSubscribeFailures['ble-att-85'] = 1;
+    fakePlatform.emitScanDevice(
+      BleDevice(
+        deviceId: 'ble-att-85',
+        name: 'Apple Peripheral',
+        services: <String>[],
+      ),
+    );
+    final device = (await transport.devices).single;
+
+    await expectLater(
+      transport.connectToDevice(device),
+      throwsA(isA<MidiNotificationSubscriptionException>()),
+    );
+
+    // One attempt only: the failure was surfaced rather than retried.
+    expect(fakePlatform.connectCalls, <String>['ble-att-85']);
+    expect(fakePlatform.subscribeCalls, <String>['ble-att-85']);
+  });
+
+  test('connectToDevice gives up after one subscribe-drop retry', () async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.android;
+    addTearDown(() => debugDefaultTargetPlatformOverride = null);
+    fakePlatform.servicesByDevice['ble-sub-hard'] = midiServices();
+    fakePlatform.transientGattSubscribeFailures['ble-sub-hard'] = 5;
+    fakePlatform.emitScanDevice(
+      BleDevice(
+        deviceId: 'ble-sub-hard',
+        name: 'Dead Handshake',
+        services: <String>[],
+      ),
+    );
+    final device = (await transport.devices).single;
+
+    await expectLater(
+      transport.connectToDevice(device),
+      throwsA(isA<MidiNotificationSubscriptionException>()),
+    );
+
+    expect(fakePlatform.connectCalls, <String>['ble-sub-hard', 'ble-sub-hard']);
+    expect(device.connected, isFalse);
+  });
+
   test('connectToDevice gives up after one GATT 133 retry', () async {
     fakePlatform.servicesByDevice['ble-133-hard'] = midiServices();
     fakePlatform.transientGattFailures['ble-133-hard'] = 5;
@@ -440,6 +585,10 @@ void main() {
   test(
     'connectToDevice maps removed pairing information to a typed exception',
     () async {
+      // iOS is where this error actually occurs, and it must be classified as
+      // a removed bond rather than as a transient failure to retry blindly.
+      debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
+      addTearDown(() => debugDefaultTargetPlatformOverride = null);
       fakePlatform.servicesByDevice['ble-stale-bond'] = midiServices();
       fakePlatform.pairingRemovedConnectIds.add('ble-stale-bond');
       fakePlatform.emitScanDevice(

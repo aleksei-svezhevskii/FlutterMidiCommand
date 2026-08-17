@@ -4,7 +4,8 @@ import 'dart:async';
 import 'dart:math';
 import 'dart:typed_data';
 
-import 'package:flutter/foundation.dart' show visibleForTesting;
+import 'package:flutter/foundation.dart'
+    show TargetPlatform, defaultTargetPlatform, visibleForTesting;
 import 'package:flutter_midi_command_platform_interface/flutter_midi_command_platform_interface.dart';
 import 'package:universal_ble/universal_ble.dart';
 
@@ -27,6 +28,24 @@ const _bleMidiTimestamp = 0x80;
 
 enum _DeviceState { none, interrogating, available, irrelevant }
 
+/// Unwraps this transport's own per-stage exceptions down to the platform
+/// error underneath.
+///
+/// Each readiness stage wraps whatever it caught in a stage-specific
+/// [MidiConnectionException], so classifying a failure by its platform cause
+/// has to look through that wrapper.
+Object _rootCause(Object error) {
+  var current = error;
+  while (current is MidiConnectionException) {
+    final cause = current.cause;
+    if (cause == null) {
+      return current;
+    }
+    current = cause;
+  }
+  return current;
+}
+
 /// True when [error] is the universal_ble error surfaced when a peripheral has
 /// discarded its side of a previous bond (iOS `CBErrorPeerRemovedPairingInformation`,
 /// "Peer removed pairing information"). It arrives as an untyped
@@ -37,13 +56,35 @@ bool _isPairingInfoRemoved(Object error) =>
 
 /// True when [error] is Android's generic `GATT_ERROR` (0x85 / 133). The
 /// Android stack returns it for almost any connection that failed or was
-/// dropped during the handshake, and universal_ble has no HCI name for it, so
-/// it arrives as `UniversalBleException(unknownError, "Unknown Error 133")`.
-/// It is usually transient: the stack has torn the GATT client down and a
-/// second attempt, after a short settle, succeeds.
-bool _isTransientGattError(Object error) =>
-    error is UniversalBleException &&
-    error.message.contains('Unknown Error 133');
+/// dropped during the handshake, and universal_ble has no HCI name for it.
+///
+/// Two shapes reach us. A failure on the connect call itself carries no status
+/// of its own and arrives as `UniversalBleException(unknownError, "Unknown
+/// Error 133")`. A GATT operation that fails because the link went away
+/// mid-handshake is named after the operation instead — "Failed to update
+/// subscription state" — and carries the status in `details`, as a string from
+/// Android and as an int elsewhere.
+///
+/// Either way it is usually transient: the stack has torn the GATT client down
+/// and a second attempt, after a short settle, succeeds.
+///
+/// The `details` reading is deliberately restricted to Android. GATT status
+/// codes are an Android concept, and Apple puts the raw `NSError` code in the
+/// same field — where 133 is `0x85`, inside `CBATTError`'s application-defined
+/// range, and means something else entirely.
+bool _isTransientGattError(Object error) {
+  if (error is! UniversalBleException) {
+    return false;
+  }
+  if (error.message.contains('Unknown Error 133')) {
+    return true;
+  }
+  if (defaultTargetPlatform != TargetPlatform.android) {
+    return false;
+  }
+  final details = error.details;
+  return details == 133 || details == '133';
+}
 
 /// How long to let the Android stack settle before retrying through a
 /// [_isTransientGattError] failure.
@@ -294,7 +335,21 @@ class UniversalBleMidiTransport implements MidiBleTransport {
       return;
     }
     _isScanning = false;
-    UniversalBle.stopScan();
+    unawaited(_stopScanIgnoringFailure());
+  }
+
+  /// Stops scanning, absorbing the failure.
+  ///
+  /// Android rejects a stop when the adapter has been switched off, which is an
+  /// ordinary thing for a user to do mid-scan. Both callers are void, so there
+  /// is nobody to surface it to, and letting the future reject unhandled turns
+  /// it into a crash report.
+  Future<void> _stopScanIgnoringFailure() async {
+    try {
+      await UniversalBle.stopScan();
+    } catch (error) {
+      _log('stopScan failed: $error');
+    }
   }
 
   @override
@@ -431,7 +486,7 @@ class UniversalBleMidiTransport implements MidiBleTransport {
     // callback wrapper").
     if (_isScanning) {
       _isScanning = false;
-      unawaited(UniversalBle.stopScan());
+      unawaited(_stopScanIgnoringFailure());
     }
     for (final device in _devices.values) {
       if (device.connectionState != MidiConnectionState.disconnected) {
@@ -548,6 +603,10 @@ class _BleMidiDevice extends MidiDevice {
   bool _bleLinkConnected = false;
   bool _readinessInProgress = false;
 
+  /// Whether this device is currently held at the high-performance connection
+  /// interval, and so has something to hand back on teardown.
+  bool _priorityRaised = false;
+
   /// Largest BLE MIDI packet this link accepts, set from the negotiated MTU in
   /// [_requestMtu]. Reset on every disconnect so a large size cannot survive
   /// into a reconnect that negotiates a smaller MTU.
@@ -593,74 +652,92 @@ class _BleMidiDevice extends MidiDevice {
     }
   }
 
+  /// Brings the device to MIDI readiness, retrying the whole sequence once
+  /// through a transient Android `GATT_ERROR`.
+  ///
+  /// [_connectLink] already retries a connect that fails outright, but the link
+  /// can also come up and then drop part-way through the handshake — most often
+  /// when reconnecting shortly after a disconnect, before the Android stack has
+  /// settled. That surfaces as a failed service discovery or subscription
+  /// rather than a failed connect, and needs the same treatment: tear the
+  /// half-built connection down and start over from a fresh GATT client.
   Future<void> connect({Duration? timeout}) async {
     if (connected) {
       return;
     }
     _readinessInProgress = true;
     try {
-      await _connectLink(timeout: timeout);
-      if (!_bleLinkConnected) {
-        final connectionState = await _runStage(
-          MidiConnectionStage.bluetoothConnect,
-          () => UniversalBle.getConnectionState(deviceId, timeout: timeout),
-          timeout,
-        );
-        _bleLinkConnected = connectionState == BleConnectionState.connected;
-      }
-      if (!_bleLinkConnected) {
-        throw MidiConnectionException(
-          deviceId: deviceId,
-          stage: MidiConnectionStage.bluetoothConnect,
-          message: 'BLE link did not reach the connected state.',
-        );
-      }
-      await _prepareMidiReadiness(timeout: timeout);
-      connected = true;
-    } catch (error) {
-      connected = false;
-      try {
-        await disconnect();
-      } catch (_) {}
-      if (_isPairingInfoRemoved(error)) {
-        // Best-effort clear of the stale bond so a later reconnect can re-pair
-        // cleanly. Unsupported on iOS (CoreBluetooth has no unpair API), so
-        // ignore failures; the surfaced exception tells the user what to do.
+      for (var attempt = 0; ; attempt++) {
         try {
-          await UniversalBle.unpair(deviceId);
-        } catch (_) {}
-        throw MidiPairingInfoRemovedException(deviceId: deviceId, cause: error);
+          await _connectOnce(timeout: timeout);
+          connected = true;
+          return;
+        } catch (error) {
+          connected = false;
+          try {
+            await disconnect();
+          } catch (_) {}
+          final cause = _rootCause(error);
+          if (_isPairingInfoRemoved(cause)) {
+            // Best-effort clear of the stale bond so a later reconnect can
+            // re-pair cleanly. Unsupported on iOS (CoreBluetooth has no unpair
+            // API), so ignore failures; the surfaced exception tells the user
+            // what to do.
+            try {
+              await UniversalBle.unpair(deviceId);
+            } catch (_) {}
+            throw MidiPairingInfoRemovedException(
+              deviceId: deviceId,
+              cause: error,
+            );
+          }
+          if (attempt > 0 || !_isTransientGattError(cause)) {
+            rethrow;
+          }
+          _log(
+            '$deviceId: link dropped with GATT_ERROR during setup ($error); '
+            'retrying once',
+          );
+        }
+        await Future<void>.delayed(_gattRetryDelay);
       }
-      rethrow;
     } finally {
       _readinessInProgress = false;
     }
   }
 
-  /// Brings up the BLE link, retrying once through a transient Android
-  /// `GATT_ERROR`. Android reports that failure only after it has already torn
-  /// its GATT client down, so the retry asks for a fresh one; the disconnect
-  /// covers the rarer case where the error arrived on a link the stack still
-  /// believes is up.
-  Future<void> _connectLink({Duration? timeout}) async {
-    for (var attempt = 0; ; attempt++) {
-      try {
-        await _runStage(
-          MidiConnectionStage.bluetoothConnect,
-          () => UniversalBle.connect(deviceId, timeout: timeout),
-          timeout,
-        );
-        return;
-      } catch (error) {
-        if (attempt > 0 || !_isTransientGattError(error)) {
-          rethrow;
-        }
-      }
-      try {
-        await UniversalBle.disconnect(deviceId);
-      } catch (_) {}
-      await Future<void>.delayed(_gattRetryDelay);
+  Future<void> _connectOnce({Duration? timeout}) async {
+    await _connectLink(timeout: timeout);
+    if (!_bleLinkConnected) {
+      final connectionState = await _runStage(
+        MidiConnectionStage.bluetoothConnect,
+        () => UniversalBle.getConnectionState(deviceId, timeout: timeout),
+        timeout,
+      );
+      _bleLinkConnected = connectionState == BleConnectionState.connected;
     }
+    if (!_bleLinkConnected) {
+      throw MidiConnectionException(
+        deviceId: deviceId,
+        stage: MidiConnectionStage.bluetoothConnect,
+        message: 'BLE link did not reach the connected state.',
+      );
+    }
+    await _prepareMidiReadiness(timeout: timeout);
+  }
+
+  /// Brings up the BLE link.
+  ///
+  /// A transient `GATT_ERROR` here is retried by [connect], which owns the
+  /// single retry for the whole sequence — the link and the readiness stages
+  /// fail the same way for the same reason, and its teardown already asks the
+  /// stack for a fresh GATT client.
+  Future<void> _connectLink({Duration? timeout}) async {
+    await _runStage(
+      MidiConnectionStage.bluetoothConnect,
+      () => UniversalBle.connect(deviceId, timeout: timeout),
+      timeout,
+    );
   }
 
   Future<void> disconnect() async {
@@ -676,7 +753,13 @@ class _BleMidiDevice extends MidiDevice {
     // Hand the radio back to the default interval before dropping the link.
     // Belt and braces: the OS resets connection parameters when the link goes
     // away, so this only matters if the disconnect itself does not complete.
-    await _requestConnectionPriority(BleConnectionPriority.balanced);
+    // Skipped when we never raised it — on a failed connect there is nothing to
+    // hand back, and asking would only log a refusal for a device that is
+    // already gone.
+    if (_priorityRaised) {
+      await _requestConnectionPriority(BleConnectionPriority.balanced);
+      _priorityRaised = false;
+    }
     try {
       await UniversalBle.disconnect(deviceId);
     } catch (_) {
@@ -827,6 +910,7 @@ class _BleMidiDevice extends MidiDevice {
         priority,
         timeout: _mtuTimeout,
       );
+      _priorityRaised = priority == BleConnectionPriority.highPerformance;
       _log('$deviceId: connection priority set to ${priority.name}');
     } catch (error) {
       _log(

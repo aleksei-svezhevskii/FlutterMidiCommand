@@ -62,7 +62,7 @@ class MidiRecorder extends ChangeNotifier {
 
     final csvString = Csv().encode(rows);
 
-    String? outputFile = await FilePicker.saveFile(
+    final Uri? outputFile = await FilePicker.saveFile(
       dialogTitle: 'Please select an output file:',
       fileName: 'midi_recording.csv',
       type: FileType.custom,
@@ -73,7 +73,7 @@ class MidiRecorder extends ChangeNotifier {
     if (outputFile == null) {
       // User canceled the picker
     } else {
-      await File(outputFile).writeAsString(csvString);
+      await File.fromUri(outputFile).writeAsString(csvString);
     }
 
     debugPrint("recording exported");

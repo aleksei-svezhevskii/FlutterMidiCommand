@@ -1,3 +1,7 @@
+## 1.1.1
+
+ - Bump "flutter_midi_command_linux" to `1.1.1` and update the platform interface dependency constraint to `^1.1.1`.
+
 ## 1.1.0
 
  - Bump "flutter_midi_command_linux" to `1.1.0` and update the platform interface dependency constraint to `^1.1.0`.
