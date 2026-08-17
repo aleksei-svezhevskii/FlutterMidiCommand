@@ -1,5 +1,8 @@
 ## 1.1.1
 
+ - FIX: extend the transient `GATT_ERROR` retry to cover the whole connection sequence, not just the link. 1.0.9 retried a connect that failed outright, but the Android stack can also bring the link up and then drop it part-way through the handshake — most often when reconnecting shortly after a disconnect, before it has settled. That surfaces as a failed service discovery or notification subscription rather than a failed connect, so it was never retried and the attempt was reported as a hard failure.
+ - FIX: recognise a `GATT_ERROR` reported against a specific GATT operation. Android names such a failure after the operation ("Failed to update subscription state") and carries the status only in `details`, so matching on the `Unknown Error 133` message missed it. Classification now reads `details` and looks through this package's own per-stage exception wrappers, which also means a peripheral that discards its pairing during a later stage is still surfaced as `MidiPairingInfoRemovedException`.
+ - FIX: skip the connection priority reset on teardown when the priority was never raised. A failed connection attempt has nothing to hand back, and asking logged a confusing `deviceNotFound` refusal for a device that was already gone.
  - FIX: absorb the failure from `stopScan` instead of dropping the future. Android rejects a stop once the adapter has been switched off — an ordinary thing for a user to do mid-scan — and both call sites are `void`, so the rejection had no listener and reached the host application's zone handler, where it was reported as a crash for a state the application already handles.
 
 ## 1.1.0

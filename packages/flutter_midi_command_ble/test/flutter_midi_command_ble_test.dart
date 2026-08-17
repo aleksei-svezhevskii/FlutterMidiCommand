@@ -34,6 +34,11 @@ class _FakeUniversalBlePlatform extends UniversalBlePlatform {
   /// GATT_ERROR, keyed by device id.
   final Map<String, int> transientGattFailures = <String, int>{};
 
+  /// Number of remaining `setNotifiable` attempts that fail the way Android
+  /// does when the link drops mid-handshake: named after the operation, with
+  /// the GATT status carried in `details` as a string.
+  final Map<String, int> transientGattSubscribeFailures = <String, int>{};
+
   /// GATT operations in the order the transport issued them.
   final List<String> gattCalls = <String>[];
 
@@ -136,6 +141,18 @@ class _FakeUniversalBlePlatform extends UniversalBlePlatform {
   ) async {
     gattCalls.add('subscribe');
     subscribeCalls.add(deviceId);
+    final remainingGattFailures =
+        transientGattSubscribeFailures[deviceId] ?? 0;
+    if (remainingGattFailures > 0) {
+      transientGattSubscribeFailures[deviceId] = remainingGattFailures - 1;
+      updateConnection(deviceId, false);
+      _connectionByDevice[deviceId] = BleConnectionState.disconnected;
+      throw UniversalBleException(
+        code: UniversalBleErrorCode.unknownError,
+        message: 'Failed to update subscription state',
+        details: '133',
+      );
+    }
     if (failingSubscribeIds.contains(deviceId)) {
       throw StateError('subscribe-failed');
     }
@@ -396,6 +413,55 @@ void main() {
     // The failed attempt reported a disconnect; the device must survive it so
     // received data still resolves to it.
     expect((await transport.devices).single.id, 'ble-133');
+  });
+
+  test('connectToDevice retries when the link drops during subscribe', () async {
+    // The link comes up, then goes away part-way through the handshake. Android
+    // names that failure after the operation rather than reporting a plain
+    // GATT_ERROR, so it only gets classified as transient if the status in
+    // `details` is read through the stage wrapper.
+    fakePlatform.servicesByDevice['ble-sub-133'] = midiServices();
+    fakePlatform.transientGattSubscribeFailures['ble-sub-133'] = 1;
+    fakePlatform.emitScanDevice(
+      BleDevice(
+        deviceId: 'ble-sub-133',
+        name: 'Flaky Handshake',
+        services: <String>[],
+      ),
+    );
+    final device = (await transport.devices).single;
+
+    await transport.connectToDevice(device);
+    await Future<void>.delayed(const Duration(milliseconds: 5));
+
+    expect(fakePlatform.connectCalls, <String>['ble-sub-133', 'ble-sub-133']);
+    expect(fakePlatform.subscribeCalls, <String>[
+      'ble-sub-133',
+      'ble-sub-133',
+    ]);
+    expect(device.connected, isTrue);
+    expect((await transport.devices).single.id, 'ble-sub-133');
+  });
+
+  test('connectToDevice gives up after one subscribe-drop retry', () async {
+    fakePlatform.servicesByDevice['ble-sub-hard'] = midiServices();
+    fakePlatform.transientGattSubscribeFailures['ble-sub-hard'] = 5;
+    fakePlatform.emitScanDevice(
+      BleDevice(
+        deviceId: 'ble-sub-hard',
+        name: 'Dead Handshake',
+        services: <String>[],
+      ),
+    );
+    final device = (await transport.devices).single;
+
+    await expectLater(
+      transport.connectToDevice(device),
+      throwsA(isA<MidiNotificationSubscriptionException>()),
+    );
+
+    expect(fakePlatform.connectCalls, <String>['ble-sub-hard', 'ble-sub-hard']);
+    expect(device.connected, isFalse);
   });
 
   test('connectToDevice gives up after one GATT 133 retry', () async {
