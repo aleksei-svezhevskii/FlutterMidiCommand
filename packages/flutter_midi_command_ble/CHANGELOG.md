@@ -1,3 +1,7 @@
+## 1.1.1
+
+ - FIX: absorb the failure from `stopScan` instead of dropping the future. Android rejects a stop once the adapter has been switched off — an ordinary thing for a user to do mid-scan — and both call sites are `void`, so the rejection had no listener and reached the host application's zone handler, where it was reported as a crash for a state the application already handles.
+
 ## 1.1.0
 
  - FIX: serialize writes per device so overlapping sends cannot interleave their BLE MIDI packets. A SysEx larger than one packet is written as several that the peripheral reassembles statefully, and `sendData` did not await the resulting writes — so a second SysEx issued before the first had drained had its packets interleaved with it in universal_ble's shared queue, and the peripheral reassembled one message out of two. Silent corruption, worse the faster the application sends, and the likely cause of bulk SysEx transfers that fail partway through with no error from the BLE layer.
