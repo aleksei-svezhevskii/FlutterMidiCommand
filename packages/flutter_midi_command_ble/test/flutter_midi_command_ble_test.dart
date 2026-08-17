@@ -1,5 +1,7 @@
 import 'dart:typed_data';
 
+import 'package:flutter/foundation.dart'
+    show TargetPlatform, debugDefaultTargetPlatformOverride;
 import 'package:flutter_midi_command_ble/flutter_midi_command_ble.dart';
 import 'package:flutter_midi_command_platform_interface/flutter_midi_command_platform_interface.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -420,6 +422,8 @@ void main() {
     // names that failure after the operation rather than reporting a plain
     // GATT_ERROR, so it only gets classified as transient if the status in
     // `details` is read through the stage wrapper.
+    debugDefaultTargetPlatformOverride = TargetPlatform.android;
+    addTearDown(() => debugDefaultTargetPlatformOverride = null);
     fakePlatform.servicesByDevice['ble-sub-133'] = midiServices();
     fakePlatform.transientGattSubscribeFailures['ble-sub-133'] = 1;
     fakePlatform.emitScanDevice(
@@ -443,7 +447,37 @@ void main() {
     expect((await transport.devices).single.id, 'ble-sub-133');
   });
 
+  test('a 133 in details is not treated as a GATT error off Android', () async {
+    // Apple puts the raw NSError code in the same field, and 133 is 0x85 —
+    // inside CBATTError's application-defined range, where it means something
+    // unrelated. Reading it as an Android GATT status there would retry a
+    // failure that is not transient.
+    debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
+    addTearDown(() => debugDefaultTargetPlatformOverride = null);
+    fakePlatform.servicesByDevice['ble-att-85'] = midiServices();
+    fakePlatform.transientGattSubscribeFailures['ble-att-85'] = 1;
+    fakePlatform.emitScanDevice(
+      BleDevice(
+        deviceId: 'ble-att-85',
+        name: 'Apple Peripheral',
+        services: <String>[],
+      ),
+    );
+    final device = (await transport.devices).single;
+
+    await expectLater(
+      transport.connectToDevice(device),
+      throwsA(isA<MidiNotificationSubscriptionException>()),
+    );
+
+    // One attempt only: the failure was surfaced rather than retried.
+    expect(fakePlatform.connectCalls, <String>['ble-att-85']);
+    expect(fakePlatform.subscribeCalls, <String>['ble-att-85']);
+  });
+
   test('connectToDevice gives up after one subscribe-drop retry', () async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.android;
+    addTearDown(() => debugDefaultTargetPlatformOverride = null);
     fakePlatform.servicesByDevice['ble-sub-hard'] = midiServices();
     fakePlatform.transientGattSubscribeFailures['ble-sub-hard'] = 5;
     fakePlatform.emitScanDevice(
