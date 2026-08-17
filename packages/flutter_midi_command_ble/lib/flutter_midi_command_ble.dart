@@ -54,27 +54,37 @@ bool _isPairingInfoRemoved(Object error) =>
     error is UniversalBleException &&
     error.message.toLowerCase().contains('pairing information');
 
-/// True when [error] is Android's generic `GATT_ERROR` (0x85 / 133). The
-/// Android stack returns it for almost any connection that failed or was
-/// dropped during the handshake, and universal_ble has no HCI name for it.
+/// True when [error] says the link failed or went away underneath us, rather
+/// than the peripheral answering with something meaningful. Such a failure is
+/// usually transient, and a second attempt after a short settle succeeds.
 ///
-/// Two shapes reach us. A failure on the connect call itself carries no status
-/// of its own and arrives as `UniversalBleException(unknownError, "Unknown
-/// Error 133")`. A GATT operation that fails because the link went away
-/// mid-handshake is named after the operation instead — "Failed to update
-/// subscription state" — and carries the status in `details`, as a string from
-/// Android and as an int elsewhere.
+/// Three shapes reach us.
 ///
-/// Either way it is usually transient: the stack has torn the GATT client down
-/// and a second attempt, after a short settle, succeeds.
+/// `deviceDisconnected` is the least ambiguous: universal_ble fails every
+/// in-flight GATT operation with it when an established connection is torn
+/// down. It cannot arise from a peripheral that was never reachable — there
+/// has to have been a connection to lose — so it always means the link dropped
+/// mid-handshake. Platform-independent.
+///
+/// The other two are Android's generic `GATT_ERROR` (0x85 / 133), which the
+/// stack returns for almost any connection that failed or was dropped during
+/// the handshake and which universal_ble has no HCI name for. A failure on the
+/// connect call itself carries no status of its own and arrives as
+/// `UniversalBleException(unknownError, "Unknown Error 133")`. A GATT
+/// operation that fails this way is named after the operation instead —
+/// "Failed to update subscription state" — and carries the status in
+/// `details`.
 ///
 /// The `details` reading is deliberately restricted to Android. GATT status
 /// codes are an Android concept, and Apple puts the raw `NSError` code in the
 /// same field — where 133 is `0x85`, inside `CBATTError`'s application-defined
 /// range, and means something else entirely.
-bool _isTransientGattError(Object error) {
+bool _isTransientLinkFailure(Object error) {
   if (error is! UniversalBleException) {
     return false;
+  }
+  if (error.code == UniversalBleErrorCode.deviceDisconnected) {
+    return true;
   }
   if (error.message.contains('Unknown Error 133')) {
     return true;
@@ -87,7 +97,7 @@ bool _isTransientGattError(Object error) {
 }
 
 /// How long to let the Android stack settle before retrying through a
-/// [_isTransientGattError] failure.
+/// [_isTransientLinkFailure] failure.
 const _gattRetryDelay = Duration(milliseconds: 500);
 
 /// Cap on the opportunistic MTU exchange. Well under the 10 s global
@@ -691,12 +701,11 @@ class _BleMidiDevice extends MidiDevice {
               cause: error,
             );
           }
-          if (attempt > 0 || !_isTransientGattError(cause)) {
+          if (attempt > 0 || !_isTransientLinkFailure(cause)) {
             rethrow;
           }
           _log(
-            '$deviceId: link dropped with GATT_ERROR during setup ($error); '
-            'retrying once',
+            '$deviceId: link dropped during setup ($error); retrying once',
           );
         }
         await Future<void>.delayed(_gattRetryDelay);

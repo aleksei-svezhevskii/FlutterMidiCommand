@@ -45,6 +45,10 @@ class _FakeUniversalBlePlatform extends UniversalBlePlatform {
   /// the GATT status carried in `details` as a string.
   final Map<String, int> transientGattSubscribeFailures = <String, int>{};
 
+  /// Number of remaining `discoverServices` attempts that fail because the
+  /// link was torn down with the operation in flight.
+  final Map<String, int> disconnectedDiscoverFailures = <String, int>{};
+
   /// GATT operations in the order the transport issued them.
   final List<String> gattCalls = <String>[];
 
@@ -139,6 +143,19 @@ class _FakeUniversalBlePlatform extends UniversalBlePlatform {
     bool withDescriptors,
   ) async {
     gattCalls.add('discover');
+    final remaining = disconnectedDiscoverFailures[deviceId] ?? 0;
+    if (remaining > 0) {
+      disconnectedDiscoverFailures[deviceId] = remaining - 1;
+      updateConnection(deviceId, false);
+      _connectionByDevice[deviceId] = BleConnectionState.disconnected;
+      // universal_ble fails every in-flight GATT operation this way when the
+      // link is torn down underneath it.
+      throw UniversalBleException(
+        code: UniversalBleErrorCode.deviceDisconnected,
+        message: 'Device Disconnected',
+        details: 'DEVICE_DISCONNECTED',
+      );
+    }
     return servicesByDevice[deviceId] ?? <BleService>[];
   }
 
@@ -462,6 +479,33 @@ void main() {
     ]);
     expect(device.connected, isTrue);
     expect((await transport.devices).single.id, 'ble-sub-133');
+  });
+
+  test('connectToDevice retries a link torn down during discovery', () async {
+    // The observed Android failure: the link comes up, discovery is issued, and
+    // the link drops with it in flight. universal_ble reports it as
+    // deviceDisconnected rather than a GATT status, so it is only classified as
+    // transient by the error code. Not platform-specific — the code means the
+    // same thing everywhere, so pin the platform to iOS to prove it.
+    debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
+    addTearDown(() => debugDefaultTargetPlatformOverride = null);
+    fakePlatform.servicesByDevice['ble-disc-drop'] = midiServices();
+    fakePlatform.disconnectedDiscoverFailures['ble-disc-drop'] = 1;
+    fakePlatform.emitScanDevice(
+      BleDevice(
+        deviceId: 'ble-disc-drop',
+        name: 'Dropped Discovery',
+        services: <String>[],
+      ),
+    );
+    final device = (await transport.devices).single;
+
+    await transport.connectToDevice(device);
+    await Future<void>.delayed(const Duration(milliseconds: 5));
+
+    expect(fakePlatform.connectCalls, <String>['ble-disc-drop', 'ble-disc-drop']);
+    expect(device.connected, isTrue);
+    expect((await transport.devices).single.id, 'ble-disc-drop');
   });
 
   test('removed pairing is typed even when a later stage reports it', () async {
