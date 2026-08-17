@@ -1,3 +1,7 @@
+## 1.1.1
+
+ - Bump "flutter_midi_command_platform_interface" to `1.1.1` for the synchronized workspace release.
+
 ## 1.1.0
 
  - FEAT: add `MidiWriteFailure` and `MidiBleTransport.onWriteFailure`, so a BLE transport can report writes it accepted from the fire-and-forget `sendData` but could not deliver. The getter has a default empty-stream implementation for transports that cannot detect write failures.

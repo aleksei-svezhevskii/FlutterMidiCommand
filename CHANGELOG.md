@@ -1,3 +1,11 @@
+## 1.1.1
+
+ - FIX(ble): retry the whole connection sequence through transient Android `GATT_ERROR` 133 failures, including failures during service discovery and notification subscription.
+ - FIX(ble): recognise operation-specific GATT failures from their details and preserve typed pairing-removal errors through connection-stage wrappers.
+ - FIX(ble): avoid resetting connection priority when it was never raised during a failed connection attempt.
+ - FIX(ble): handle `stopScan` failures when Bluetooth is switched off during a scan instead of surfacing an unhandled asynchronous error.
+ - Update federated package constraints to `^1.1.1`.
+
 ## 1.1.0
 
  - FIX(darwin): read every packet of a coalesced `MIDIPacketList` from the original list memory. Packets after the first were read from unrelated memory and anything over 256 bytes was truncated, affecting virtual devices; native devices already had a correct implementation. Virtual device timestamps now report nanoseconds, matching native devices.
