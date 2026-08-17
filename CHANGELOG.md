@@ -1,3 +1,8 @@
+## 1.1.2
+
+ - FIX(ble): retry a connection sequence whose link was torn down mid-handshake. universal_ble reports that as `deviceDisconnected` rather than a GATT status, so the retry shipped in 1.1.1 did not apply. Unlike a GATT status the code cannot arise from a peripheral that was never reachable, so it is honoured on every platform.
+ - Update federated package constraints to `^1.1.2`.
+
 ## 1.1.1
 
  - FIX(ble): retry the whole connection sequence through transient Android `GATT_ERROR` 133 failures, including failures during service discovery and notification subscription.

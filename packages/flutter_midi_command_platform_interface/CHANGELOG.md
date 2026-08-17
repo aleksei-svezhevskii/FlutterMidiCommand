@@ -1,3 +1,7 @@
+## 1.1.2
+
+ - Bump "flutter_midi_command_platform_interface" to `1.1.2` for the synchronized workspace release.
+
 ## 1.1.1
 
  - Bump "flutter_midi_command_platform_interface" to `1.1.1` for the synchronized workspace release.
