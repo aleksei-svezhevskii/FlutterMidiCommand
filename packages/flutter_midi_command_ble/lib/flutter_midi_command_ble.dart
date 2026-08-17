@@ -294,7 +294,21 @@ class UniversalBleMidiTransport implements MidiBleTransport {
       return;
     }
     _isScanning = false;
-    UniversalBle.stopScan();
+    unawaited(_stopScanIgnoringFailure());
+  }
+
+  /// Stops scanning, absorbing the failure.
+  ///
+  /// Android rejects a stop when the adapter has been switched off, which is an
+  /// ordinary thing for a user to do mid-scan. Both callers are void, so there
+  /// is nobody to surface it to, and letting the future reject unhandled turns
+  /// it into a crash report.
+  Future<void> _stopScanIgnoringFailure() async {
+    try {
+      await UniversalBle.stopScan();
+    } catch (error) {
+      _log('stopScan failed: $error');
+    }
   }
 
   @override
@@ -431,7 +445,7 @@ class UniversalBleMidiTransport implements MidiBleTransport {
     // callback wrapper").
     if (_isScanning) {
       _isScanning = false;
-      unawaited(UniversalBle.stopScan());
+      unawaited(_stopScanIgnoringFailure());
     }
     for (final device in _devices.values) {
       if (device.connectionState != MidiConnectionState.disconnected) {
