@@ -117,8 +117,12 @@ public class SwiftFlutterMidiCommandPlugin: NSObject, FlutterPlugin, MidiHostApi
         knownDeviceSnapshots = currentDeviceSnapshots()
 
 #if os(iOS)
-        session = MIDINetworkSession.default()
-        session?.connectionPolicy = MIDINetworkConnectionPolicy.anyone
+        // Do not create the MIDI network session here. Touching
+        // MIDINetworkSession.default() makes iOS 14+ show the system
+        // "Allow [app] to find devices on local networks" permission prompt
+        // at app startup, even though network MIDI is disabled by default.
+        // The session is created lazily in setNetworkSessionEnabled(true),
+        // which is the explicit opt-in for network (RTP) MIDI.
 #endif
     }
 
@@ -215,6 +219,10 @@ public class SwiftFlutterMidiCommandPlugin: NSObject, FlutterPlugin, MidiHostApi
 
     func setNetworkSessionEnabled(enabled: Bool) throws {
 #if os(iOS)
+        if enabled && session == nil {
+            session = MIDINetworkSession.default()
+            session?.connectionPolicy = MIDINetworkConnectionPolicy.anyone
+        }
         session?.isEnabled = enabled
 #endif
     }

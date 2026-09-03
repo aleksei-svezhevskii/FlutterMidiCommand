@@ -1,3 +1,7 @@
+## Unreleased
+
+ - FIX(ios): do not touch `MIDINetworkSession.default()` in `setup()`. Creating the session at plugin init made iOS 14+ show the system "Allow [app] to find devices on local networks" permission prompt at app startup, even though network MIDI is disabled by default. The session is now created lazily in `setNetworkSessionEnabled(true)`, the existing explicit opt-in for network (RTP) MIDI.
+
 ## 1.1.2
 
  - Bump "flutter_midi_command_darwin" to `1.1.2` and update the platform interface dependency constraint to `^1.1.2`.
